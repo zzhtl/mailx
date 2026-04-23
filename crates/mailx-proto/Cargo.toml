@@ -1,0 +1,34 @@
+[package]
+name = "mailx-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+async-imap = { version = "0.10", default-features = false, features = ["runtime-tokio"] }
+async-native-tls = { version = "0.5", default-features = false, features = ["runtime-tokio"] }
+encoding_rs = "0.8"
+base64 = "0.22"
+lettre = { version = "0.11", default-features = false, features = [
+    "tokio1",
+    "tokio1-native-tls",
+    "smtp-transport",
+    "builder",
+] }
+mime = "0.3"
+
+[[example]]
+name = "imap_probe"
+path = "examples/imap_probe.rs"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tracing-subscriber = { workspace = true }

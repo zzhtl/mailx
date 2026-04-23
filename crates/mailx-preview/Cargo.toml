@@ -1,0 +1,18 @@
+[package]
+name = "mailx-preview"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+image = { version = "0.25", default-features = false, features = [
+    "jpeg", "png", "gif", "webp", "bmp",
+] }
+encoding_rs = "0.8"
+pdfium-render = { version = "0.8", features = ["image", "thread_safe"] }
+tempfile = "3"

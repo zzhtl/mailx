@@ -1,0 +1,16 @@
+[package]
+name = "mailx-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+mail-parser = "0.9"
+encoding_rs = "0.8"
+ammonia = "4"
+html-escape = "0.2"

@@ -1,0 +1,43 @@
+[package]
+name = "mailx-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mailx"
+path = "src/main.rs"
+
+[package.metadata.packager]
+product-name = "mailx"
+identifier = "dev.zzhtl.mailx"
+description = "跨平台邮件客户端（Rust + egui）"
+authors = ["zzhtl"]
+category = "Network"
+formats = ["deb", "appimage", "msi", "app", "dmg"]
+binaries = [{ path = "mailx", main = true }]
+before-packaging-command = "cargo build --release"
+
+[package.metadata.packager.deb]
+depends = ["libwebkit2gtk-4.1-0", "libgtk-3-0"]
+
+
+[dependencies]
+mailx-core = { workspace = true }
+mailx-proto = { workspace = true }
+mailx-store = { workspace = true }
+mailx-render = { workspace = true }
+mailx-preview = { workspace = true }
+
+eframe = { workspace = true }
+egui = { workspace = true }
+
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+tokio = { workspace = true, features = ["full"] }
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+open = "5"
+tempfile = "3"
