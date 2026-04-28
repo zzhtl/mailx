@@ -1,11 +1,20 @@
-//! 后台 Tokio runtime + 命令分发。
+//! 后台 Tokio runtime + 命令分发 + INBOX 自动轮询 + OS 通知。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use mailx_proto::{match_by_email, AuthKind, ImapClient, ImapCredentials, ProviderPreset};
+use mailx_proto::{
+    decode_rfc2047, match_by_email, AuthKind, ImapClient, ImapCredentials, ProviderPreset,
+};
 use mailx_store::{AccountId, FolderId, NewAccount, NewMessage, Store};
 use tokio::sync::mpsc;
+
+/// 后台 INBOX 轮询周期。轮询用 IMAP UID FETCH（增量），开销小；
+/// 想做到秒级新邮件感知需要 IMAP IDLE，留作后续。
+const INBOX_POLL_INTERVAL: Duration = Duration::from_secs(60);
+/// 启动后第一次轮询前的延迟，避开 UI 冷启动时的密集 IO。
+const INBOX_POLL_INITIAL_DELAY: Duration = Duration::from_secs(15);
 
 use crate::command::{AddAccountReq, Command, ComposeDraft};
 use crate::event::Event;
@@ -67,6 +76,20 @@ async fn run_dispatcher(
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
     evt_tx: mpsc::UnboundedSender<Event>,
 ) {
+    // 后台 INBOX 轮询：每个账户的 INBOX 周期性 SyncFolder，新邮件落库 + OS 通知。
+    let poll_store = store.clone();
+    let poll_tx = evt_tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(INBOX_POLL_INITIAL_DELAY).await;
+        let mut tick = tokio::time::interval(INBOX_POLL_INTERVAL);
+        // 第一次 tick 立即返回，再开始正常间隔
+        tick.tick().await;
+        loop {
+            poll_inboxes(&poll_store, &poll_tx).await;
+            tick.tick().await;
+        }
+    });
+
     while let Some(cmd) = cmd_rx.recv().await {
         let store = store.clone();
         let evt_tx = evt_tx.clone();
@@ -90,13 +113,12 @@ async fn handle_command(
         Command::AddAccount(req) => add_account(store, evt_tx, req).await,
         Command::DeleteAccount(id) => delete_account(store, evt_tx, id).await,
         Command::RefreshFolders(id) => refresh_folders(store, evt_tx, id).await,
-        Command::SyncFolder { account_id, folder_id } => {
-            sync_folder(store, evt_tx, account_id, folder_id).await
-        }
+        Command::SyncFolder {
+            account_id,
+            folder_id,
+        } => sync_folder(store, evt_tx, account_id, folder_id).await,
         Command::FetchBody(msg_id) => fetch_body(store, evt_tx, msg_id).await,
-        Command::MarkRead { message_id, read } => {
-            set_read(store, evt_tx, message_id, read).await
-        }
+        Command::MarkRead { message_id, read } => set_read(store, evt_tx, message_id, read).await,
         Command::MoveToTrash(id) => move_to_trash(store, evt_tx, id).await,
         Command::Delete(id) => delete_msg(store, evt_tx, id).await,
         Command::Send(draft) => send_mail(store, evt_tx, draft).await,
@@ -107,12 +129,18 @@ async fn handle_command(
         }
         Command::LoadFolders(account_id) => {
             let folders = store.list_folders(account_id).await?;
-            let _ = evt_tx.send(Event::FoldersLoaded { account_id, folders });
+            let _ = evt_tx.send(Event::FoldersLoaded {
+                account_id,
+                folders,
+            });
             Ok(())
         }
         Command::LoadMessages { folder_id, limit } => {
             let messages = store.list_messages(folder_id, limit).await?;
-            let _ = evt_tx.send(Event::MessagesLoaded { folder_id, messages });
+            let _ = evt_tx.send(Event::MessagesLoaded {
+                folder_id,
+                messages,
+            });
             Ok(())
         }
     }
@@ -258,7 +286,11 @@ async fn sync_folder(
             .update_folder_sync(folder_id, uidvalidity as i64, folder.last_seen_uid)
             .await?;
         client.logout().await.ok();
-        let _ = evt_tx.send(Event::FolderSynced { account_id, folder_id, new_messages: 0 });
+        let _ = evt_tx.send(Event::FolderSynced {
+            account_id,
+            folder_id,
+            new_messages: 0,
+        });
         return Ok(());
     }
 
@@ -283,18 +315,113 @@ async fn sync_folder(
         })
         .collect();
     let new_count = new_msgs.len();
+    let unseen_samples: Vec<(String, String)> = new_msgs
+        .iter()
+        .filter(|m| !m.seen)
+        .take(3)
+        .map(|m| {
+            (
+                decode_rfc2047(m.subject.as_deref().unwrap_or("(无主题)")),
+                decode_rfc2047(m.from_addr.as_deref().unwrap_or("?")),
+            )
+        })
+        .collect();
+    let unseen_total = new_msgs.iter().filter(|m| !m.seen).count();
     store.upsert_messages(folder_id, &new_msgs).await?;
     store
         .update_folder_sync(folder_id, uidvalidity as i64, max_uid)
         .await?;
 
     client.logout().await.ok();
+
+    if unseen_total > 0 {
+        let account_email = store
+            .list_accounts()
+            .await
+            .ok()
+            .and_then(|list| list.into_iter().find(|a| a.id == account_id))
+            .map(|a| a.email)
+            .unwrap_or_default();
+        notify_new_messages(&account_email, &folder.name, unseen_total, &unseen_samples);
+    }
+
     let _ = evt_tx.send(Event::FolderSynced {
         account_id,
         folder_id,
         new_messages: new_count,
     });
     Ok(())
+}
+
+/// 弹出系统级桌面通知。失败不抛错（headless / 无 dbus / Windows 无 WinRT 时静默忽略）。
+fn notify_new_messages(
+    account_email: &str,
+    folder_name: &str,
+    count: usize,
+    samples: &[(String, String)],
+) {
+    let title = if count == 1 {
+        format!("新邮件 · {account_email}")
+    } else {
+        format!("{count} 封新邮件 · {account_email}")
+    };
+    let body = if let Some((subject, from)) = samples.first() {
+        let mut s = format!("{from}\n{subject}");
+        if count > samples.len() {
+            s.push_str(&format!("\n…等 {count} 封"));
+        } else if samples.len() > 1 {
+            for (sub, fr) in &samples[1..] {
+                s.push_str(&format!("\n• {fr}: {sub}"));
+            }
+        }
+        s
+    } else {
+        format!("文件夹 {folder_name}")
+    };
+
+    if let Err(e) = notify_rust::Notification::new()
+        .summary(&title)
+        .body(&body)
+        .appname("mailx")
+        .icon("mail-message-new")
+        .show()
+    {
+        tracing::debug!("desktop notification failed: {e}");
+    }
+}
+
+/// 周期性遍历所有账户的 INBOX 跑一次 SyncFolder。失败仅记日志，不影响下一轮。
+async fn poll_inboxes(store: &Store, evt_tx: &mpsc::UnboundedSender<Event>) {
+    let accounts = match store.list_accounts().await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("inbox poll: list_accounts failed: {e}");
+            return;
+        }
+    };
+    for account in accounts {
+        let folders = match store.list_folders(account.id).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("inbox poll: list_folders({}) failed: {e}", account.email);
+                continue;
+            }
+        };
+        let inbox = match folders
+            .into_iter()
+            .find(|f| f.name.eq_ignore_ascii_case("INBOX"))
+        {
+            Some(f) => f,
+            None => continue,
+        };
+        if let Err(e) = sync_folder(store, evt_tx, account.id, inbox.id).await {
+            tracing::warn!(
+                "inbox poll: sync_folder({}/{}) failed: {e}",
+                account.email,
+                inbox.name
+            );
+        }
+    }
 }
 
 async fn fetch_body(
@@ -309,7 +436,10 @@ async fn fetch_body(
     // 这是"点一封邮件卡 1~3 秒"的主要原因：TLS 握手 + LOGIN + SELECT + FETCH + LOGOUT 是硬开销。
     let path = store.body_path_for(account_id, folder_id, uid);
     if tokio::fs::metadata(&path).await.is_ok() {
-        let _ = evt_tx.send(Event::BodyReady { message_id, body_path: path });
+        let _ = evt_tx.send(Event::BodyReady {
+            message_id,
+            body_path: path,
+        });
         return Ok(());
     }
 
@@ -327,7 +457,10 @@ async fn fetch_body(
         .set_body_path(message_id, path.to_string_lossy().as_ref())
         .await?;
 
-    let _ = evt_tx.send(Event::BodyReady { message_id, body_path: path });
+    let _ = evt_tx.send(Event::BodyReady {
+        message_id,
+        body_path: path,
+    });
     Ok(())
 }
 
@@ -437,7 +570,10 @@ async fn send_mail(
     if total > WARN_TOTAL {
         tracing::warn!("附件总大小 {} 字节较大，可能被部分邮件服务器拒绝", total);
     }
-    let _ = evt_tx.send(Event::SendProgress { bytes_sent: 0, total });
+    let _ = evt_tx.send(Event::SendProgress {
+        bytes_sent: 0,
+        total,
+    });
 
     let creds = mailx_proto::SmtpCredentials {
         email: account.email.clone(),
@@ -455,14 +591,20 @@ async fn send_mail(
         attachments: &attach_paths,
     };
     mailx_proto::smtp_send(&preset, &creds, req).await?;
-    let _ = evt_tx.send(Event::SendProgress { bytes_sent: total, total });
+    let _ = evt_tx.send(Event::SendProgress {
+        bytes_sent: total,
+        total,
+    });
     let _ = evt_tx.send(Event::SendCompleted);
     Ok(())
 }
 
 // ---------- 共享 helpers ----------
 
-async fn open_client(store: &Store, account_id: AccountId) -> Result<(ImapClient, mailx_store::Account)> {
+async fn open_client(
+    store: &Store,
+    account_id: AccountId,
+) -> Result<(ImapClient, mailx_store::Account)> {
     let accounts = store.list_accounts().await?;
     let account = accounts
         .into_iter()

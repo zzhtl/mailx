@@ -1,27 +1,66 @@
 //! HTML 清洗：移除脚本/事件/远程资源；把 `cid:xxx` 替换成内嵌 data: URL。
 
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap};
 
 use ammonia::Builder;
 
 use crate::InlinePart;
 
 pub fn clean_email_html(raw_html: &str, inline: &HashMap<String, InlinePart>) -> String {
+    // 先替换 cid，再交给 ammonia；否则 `cid:` 会被 URL scheme 过滤提前移除。
+    let with_inline = replace_cids(raw_html, inline);
+
     // 先做 ammonia 清洗：允许常见排版标签与内联样式，禁止脚本、事件、远程跟踪图
     let mut builder = Builder::new();
     builder
+        .add_url_schemes(&["data"])
+        .attribute_filter(|element, attribute, value| match (element, attribute) {
+            ("img", "src") if value.trim_start().to_ascii_lowercase().starts_with("data:") => {
+                if value
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("data:image/")
+                {
+                    Some(Cow::Borrowed(value))
+                } else {
+                    None
+                }
+            }
+            (_, "href" | "src") if value.trim_start().to_ascii_lowercase().starts_with("data:") => {
+                None
+            }
+            _ => Some(Cow::Borrowed(value)),
+        })
         .add_tag_attributes("a", &["href", "title", "target"])
-        .add_tag_attributes("img", &["src", "alt", "width", "height", "style"])
-        .add_tag_attributes("span", &["style"])
-        .add_tag_attributes("p", &["style"])
-        .add_tag_attributes("div", &["style"])
-        .add_tag_attributes("td", &["style", "colspan", "rowspan"])
-        .add_tag_attributes("table", &["style", "cellspacing", "cellpadding", "border"])
-        .add_generic_attributes(&["style"]);
-    let cleaned = builder.clean(raw_html).to_string();
-
-    // 将 cid:xxx 换成 data: URL（小图内嵌最稳妥；大图后续可改为 wry 自定义 scheme）
-    replace_cids(&cleaned, inline)
+        .add_tag_attributes("img", &["src", "alt", "width", "height", "style", "align"])
+        .add_tag_attributes(
+            "table",
+            &[
+                "style",
+                "cellspacing",
+                "cellpadding",
+                "border",
+                "bgcolor",
+                "align",
+                "width",
+            ],
+        )
+        .add_tag_attributes("tr", &["style", "bgcolor", "align"])
+        .add_tag_attributes(
+            "td",
+            &[
+                "style", "colspan", "rowspan", "bgcolor", "align", "valign", "width", "height",
+            ],
+        )
+        .add_tag_attributes(
+            "th",
+            &[
+                "style", "colspan", "rowspan", "bgcolor", "align", "valign", "width", "height",
+            ],
+        )
+        // 块级标签普遍允许 align/bgcolor，邮件常见布局属性。
+        .add_generic_attributes(&["style", "align", "bgcolor"]);
+    builder.clean(&with_inline).to_string()
 }
 
 fn replace_cids(html: &str, inline: &HashMap<String, InlinePart>) -> String {
@@ -52,8 +91,7 @@ fn replace_cids(html: &str, inline: &HashMap<String, InlinePart>) -> String {
 
 // 避免多加一个 crate：手写一个简 base64（足够邮件内嵌图用）
 fn encode_base64(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
     let mut chunks = input.chunks_exact(3);
     for c in &mut chunks {
@@ -84,3 +122,34 @@ fn encode_base64(input: &[u8]) -> String {
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cid_image_survives_as_data_uri() {
+        let mut inline = HashMap::new();
+        inline.insert(
+            "logo".to_string(),
+            InlinePart {
+                content_type: "image/png".to_string(),
+                data: vec![1, 2, 3],
+            },
+        );
+
+        let cleaned = clean_email_html(r#"<p><img src="cid:logo" alt="logo"></p>"#, &inline);
+
+        assert!(cleaned.contains(r#"<img src="data:image/png;base64,AQID" alt="logo">"#));
+    }
+
+    #[test]
+    fn data_href_is_removed_but_data_image_src_is_kept() {
+        let cleaned = clean_email_html(
+            r#"<a href="data:text/html;base64,PGgxPg==">x</a><img src="data:image/png;base64,AQID">"#,
+            &HashMap::new(),
+        );
+
+        assert!(cleaned.contains("<a rel=\"noopener noreferrer\">x</a>"));
+        assert!(cleaned.contains(r#"<img src="data:image/png;base64,AQID">"#));
+    }
+}

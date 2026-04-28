@@ -518,10 +518,18 @@ impl MailxApp {
                             (None, Some(_)) => self.body_cache = None,
                             (None, None) => {}
                         }
-                        if let Some(req) = reader::show(ui, selected_row, self.body_cache.as_mut())
-                        {
-                            self.preview = Some(req);
-                        }
+                        let reader_size = ui.available_size_before_wrap();
+                        ui.allocate_ui_with_layout(
+                            reader_size,
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                if let Some(req) =
+                                    reader::show(ui, selected_row, self.body_cache.as_mut())
+                                {
+                                    self.preview = Some(req);
+                                }
+                            },
+                        );
                     } else {
                         ui.vertical_centered(|ui| {
                             ui.add_space(40.0);

@@ -1,10 +1,10 @@
 //! HTML → 富文本块：把 sanitize 之后的邮件 HTML 解析成一组语义块（段落 / 标题 / 分割线 / 列表项 /
-//! 引用），每个块里是一串带内联样式的 `Span`，供 UI 层用 egui 直接画出来。
+//! 引用 / 表格 / 图片），每个块里是一串带内联样式的 `Span`，供 UI 层用 egui 直接画出来。
 //!
 //! 这是一个"面向邮件"的极简解析器：
 //! - 邮件 HTML 已经经过 ammonia 清洗，标签集合相对收敛；
-//! - 我们关心的只是"让粗体/标题/颜色/超链接/基本字号"能在原生 UI 上显示出来；
-//! - 复杂的 table 排版降级为"每行一段、单元格之间加空格"。
+//! - 我们关心的只是"让粗体/标题/颜色/超链接/基本字号/对齐/背景/表格"能在原生 UI 上显示出来；
+//! - 表格按旧版线性文本路径降级，避免邮件里常见的布局 table 把原有正文排版改坏。
 
 /// 一段文本的视觉样式。
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -24,7 +24,10 @@ pub struct SpanStyle {
 
 impl SpanStyle {
     pub fn base() -> Self {
-        Self { size: 1.0, ..Default::default() }
+        Self {
+            size: 1.0,
+            ..Default::default()
+        }
     }
 }
 
@@ -36,30 +39,86 @@ pub struct Span {
     pub br_after: bool,
 }
 
-/// 语义块。一个块对应视觉上一段独立文字/分割。
+/// 块级对齐。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Align {
+    #[default]
+    Start,
+    Center,
+    End,
+    Justify,
+}
+
+/// 内嵌图片（`<img>`）。`src` 可能是 `data:image/...;base64,...` 或远程 URL。
 #[derive(Clone, Debug)]
-pub enum Block {
+pub struct ImageRef {
+    pub src: String,
+    pub alt: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+/// 表格单元格。`blocks` 是 cell 内部的递归解析结果。
+#[derive(Clone, Debug)]
+pub struct TableCell {
+    pub blocks: Vec<Block>,
+    pub colspan: u32,
+    pub rowspan: u32,
+    pub bg: Option<[u8; 3]>,
+    pub align: Align,
+    pub is_header: bool,
+}
+
+/// 块的语义类型。
+#[derive(Clone, Debug)]
+pub enum BlockKind {
     Paragraph(Vec<Span>),
     Heading(u8, Vec<Span>),
     Quote(Vec<Span>),
     ListItem(Vec<Span>),
     Rule,
+    Image(ImageRef),
+    Table(Vec<Vec<TableCell>>),
+}
+
+/// 语义块：内容 + 块级对齐 / 背景。
+#[derive(Clone, Debug)]
+pub struct Block {
+    pub kind: BlockKind,
+    pub align: Align,
+    pub bg: Option<[u8; 3]>,
 }
 
 impl Block {
+    pub fn new(kind: BlockKind) -> Self {
+        Self {
+            kind,
+            align: Align::Start,
+            bg: None,
+        }
+    }
+
     pub fn spans(&self) -> Option<&[Span]> {
-        match self {
-            Block::Paragraph(s) | Block::Heading(_, s) | Block::Quote(s) | Block::ListItem(s) => {
-                Some(s)
-            }
-            Block::Rule => None,
+        match &self.kind {
+            BlockKind::Paragraph(s)
+            | BlockKind::Heading(_, s)
+            | BlockKind::Quote(s)
+            | BlockKind::ListItem(s) => Some(s),
+            _ => None,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.spans()
-            .map(|s| s.iter().all(|sp| sp.text.trim().is_empty() && !sp.br_after))
-            .unwrap_or(false)
+        match &self.kind {
+            BlockKind::Rule | BlockKind::Image(_) => false,
+            BlockKind::Table(rows) => rows
+                .iter()
+                .all(|r| r.iter().all(|c| c.blocks.iter().all(|b| b.is_empty()))),
+            _ => self
+                .spans()
+                .map(|s| s.iter().all(|sp| sp.text.trim().is_empty() && !sp.br_after))
+                .unwrap_or(false),
+        }
     }
 }
 
@@ -90,12 +149,12 @@ impl Current {
         }
     }
 
-    fn into_block(self) -> Block {
+    fn into_kind(self) -> BlockKind {
         match self {
-            Current::Paragraph(s) => Block::Paragraph(s),
-            Current::Heading(l, s) => Block::Heading(l, s),
-            Current::Quote(s) => Block::Quote(s),
-            Current::ListItem(s) => Block::ListItem(s),
+            Current::Paragraph(s) => BlockKind::Paragraph(s),
+            Current::Heading(l, s) => BlockKind::Heading(l, s),
+            Current::Quote(s) => BlockKind::Quote(s),
+            Current::ListItem(s) => BlockKind::ListItem(s),
         }
     }
 }
@@ -105,12 +164,20 @@ struct Parser<'a> {
     src: &'a str,
     pos: usize,
     style_stack: Vec<SpanStyle>,
+    /// 块级属性栈：随 `<p>/<div>/<td>` 等 push，close 时 pop。栈顶决定下一段 flush 时块的 align/bg。
+    block_attr_stack: Vec<BlockAttr>,
     blocks: Vec<Block>,
     current: Current,
     /// 是否处于引用块（blockquote）内，影响新段落的默认块类型。
     quote_depth: u32,
     /// 是否处于 pre / code 块，用于保留原始空白（简化处理，暂不展开）。
     pre_depth: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct BlockAttr {
+    align: Option<Align>,
+    bg: Option<[u8; 3]>,
 }
 
 impl<'a> Parser<'a> {
@@ -120,6 +187,7 @@ impl<'a> Parser<'a> {
             src,
             pos: 0,
             style_stack: vec![SpanStyle::base()],
+            block_attr_stack: Vec::new(),
             blocks: Vec::new(),
             current: Current::Paragraph(Vec::new()),
             quote_depth: 0,
@@ -168,14 +236,17 @@ impl<'a> Parser<'a> {
             return;
         }
 
-        // <script> / <style>：直接跳过整段内容
-        if self.starts_with_ci_name(b"script") {
-            self.skip_block_tag(b"script");
-            return;
-        }
-        if self.starts_with_ci_name(b"style") {
-            self.skip_block_tag(b"style");
-            return;
+        // <script> / <style> / <title> / <head>：直接跳过整段内容
+        for skip in [
+            b"script".as_slice(),
+            b"style".as_slice(),
+            b"title".as_slice(),
+            b"head".as_slice(),
+        ] {
+            if self.starts_with_ci_name(skip) {
+                self.skip_block_tag(skip);
+                return;
+            }
         }
 
         // 普通标签
@@ -274,11 +345,18 @@ impl<'a> Parser<'a> {
                 return;
             }
         }
-        spans.push(Span { text: s, style, br_after: false });
+        spans.push(Span {
+            text: s,
+            style,
+            br_after: false,
+        });
     }
 
     fn current_style(&self) -> SpanStyle {
-        self.style_stack.last().cloned().unwrap_or_else(SpanStyle::base)
+        self.style_stack
+            .last()
+            .cloned()
+            .unwrap_or_else(SpanStyle::base)
     }
 
     fn push_style(&mut self, style: SpanStyle) {
@@ -297,6 +375,23 @@ impl<'a> Parser<'a> {
         s
     }
 
+    fn current_block_attr(&self) -> BlockAttr {
+        // 取栈中最近一个有效 align/bg。栈空时返回默认。
+        let mut out = BlockAttr::default();
+        for layer in self.block_attr_stack.iter().rev() {
+            if out.align.is_none() && layer.align.is_some() {
+                out.align = layer.align;
+            }
+            if out.bg.is_none() && layer.bg.is_some() {
+                out.bg = layer.bg;
+            }
+            if out.align.is_some() && out.bg.is_some() {
+                break;
+            }
+        }
+        out
+    }
+
     fn flush_current(&mut self) {
         let mut next_default = if self.quote_depth > 0 {
             Current::Quote(Vec::new())
@@ -305,7 +400,13 @@ impl<'a> Parser<'a> {
         };
         std::mem::swap(&mut self.current, &mut next_default);
         let finished = next_default;
-        let block = finished.into_block();
+        let kind = finished.into_kind();
+        let attr = self.current_block_attr();
+        let block = Block {
+            kind,
+            align: attr.align.unwrap_or(Align::Start),
+            bg: attr.bg,
+        };
         if !block.is_empty() {
             self.blocks.push(block);
         }
@@ -318,7 +419,11 @@ impl<'a> Parser<'a> {
             last.br_after = true;
         } else {
             // 空段落 + <br>：放一个空 span 承载 break，渲染时会插入一行空白
-            spans.push(Span { text: String::new(), style, br_after: true });
+            spans.push(Span {
+                text: String::new(),
+                style,
+                br_after: true,
+            });
         }
     }
 
@@ -327,22 +432,30 @@ impl<'a> Parser<'a> {
         self.current = kind;
     }
 
-    fn on_open(&mut self, name: &str, attrs: &[(String, String)], _self_closing: bool) {
+    fn on_open(&mut self, name: &str, attrs: &[(String, String)], self_closing: bool) {
         match name {
             // 块级 — 起新段落
             "p" | "div" | "section" | "article" | "header" | "footer" | "main" | "nav"
-            | "aside" | "figure" | "figcaption" | "table" | "tbody" | "thead" | "tfoot"
-            | "address" => {
+            | "aside" | "figure" | "figcaption" | "address" | "center" | "dl" | "dt" | "dd"
+            | "table" | "tbody" | "thead" | "tfoot" => {
                 self.start_block(Current::Paragraph(Vec::new()));
+                let mut attr = block_attr_from_attrs(attrs);
+                if name == "center" && attr.align.is_none() {
+                    attr.align = Some(Align::Center);
+                }
+                self.block_attr_stack.push(attr);
                 self.push_style(style_from_attrs(attrs, &self.current_style()));
             }
             "tr" => {
                 self.start_block(Current::Paragraph(Vec::new()));
+                self.block_attr_stack.push(block_attr_from_attrs(attrs));
                 self.push_style(style_from_attrs(attrs, &self.current_style()));
             }
             "td" | "th" => {
-                // 在同一段内用空格分隔单元格
-                let style = style_from_attrs(attrs, &self.current_style());
+                let mut style = style_from_attrs(attrs, &self.current_style());
+                if name == "th" {
+                    style.bold = true;
+                }
                 self.push_style(style);
                 let cur_style = self.current_style();
                 let spans = self.current.spans_mut();
@@ -351,22 +464,24 @@ impl<'a> Parser<'a> {
                     .map(|s| !s.text.ends_with(' ') && !s.br_after && !s.text.is_empty())
                     .unwrap_or(false);
                 if needs_space {
-                    let merge = spans
-                        .last()
-                        .map(|s| s.style == cur_style && !s.br_after)
-                        .unwrap_or(false);
-                    if merge {
-                        if let Some(last) = spans.last_mut() {
-                            last.text.push(' ');
-                        }
+                    if let Some(last) = spans
+                        .last_mut()
+                        .filter(|s| s.style == cur_style && !s.br_after)
+                    {
+                        last.text.push(' ');
                     } else {
-                        spans.push(Span { text: " ".into(), style: cur_style, br_after: false });
+                        spans.push(Span {
+                            text: " ".into(),
+                            style: cur_style,
+                            br_after: false,
+                        });
                     }
                 }
             }
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 let lvl: u8 = name[1..].parse().unwrap_or(3);
                 self.start_block(Current::Heading(lvl, Vec::new()));
+                self.block_attr_stack.push(block_attr_from_attrs(attrs));
                 let mut style = style_from_attrs(attrs, &self.current_style());
                 style.bold = true;
                 style.size = heading_size(lvl);
@@ -375,29 +490,53 @@ impl<'a> Parser<'a> {
             "blockquote" => {
                 self.quote_depth += 1;
                 self.start_block(Current::Quote(Vec::new()));
+                self.block_attr_stack.push(block_attr_from_attrs(attrs));
                 self.push_style(style_from_attrs(attrs, &self.current_style()));
             }
             "ul" | "ol" => {
                 self.flush_current();
+                self.block_attr_stack.push(block_attr_from_attrs(attrs));
                 self.push_style(style_from_attrs(attrs, &self.current_style()));
             }
             "li" => {
                 self.start_block(Current::ListItem(Vec::new()));
+                self.block_attr_stack.push(block_attr_from_attrs(attrs));
                 self.push_style(style_from_attrs(attrs, &self.current_style()));
             }
             "pre" => {
                 self.pre_depth += 1;
                 self.start_block(Current::Paragraph(Vec::new()));
+                self.block_attr_stack.push(block_attr_from_attrs(attrs));
                 let mut style = style_from_attrs(attrs, &self.current_style());
                 style.code = true;
                 self.push_style(style);
             }
             "hr" => {
                 self.flush_current();
-                self.blocks.push(Block::Rule);
+                self.blocks.push(Block::new(BlockKind::Rule));
             }
             "br" => {
                 self.mark_break();
+            }
+            "img" => {
+                let _ = self_closing;
+                if let Some(src) = attr(attrs, "src") {
+                    let alt = attr(attrs, "alt").map(|s| s.to_string());
+                    let w = attr(attrs, "width").and_then(|v| parse_dim(v));
+                    let h = attr(attrs, "height").and_then(|v| parse_dim(v));
+                    self.flush_current();
+                    let attr_now = self.current_block_attr();
+                    self.blocks.push(Block {
+                        kind: BlockKind::Image(ImageRef {
+                            src: src.to_string(),
+                            alt,
+                            width: w,
+                            height: h,
+                        }),
+                        align: attr_now.align.unwrap_or(Align::Start),
+                        bg: attr_now.bg,
+                    });
+                }
             }
             // 内联样式
             "b" | "strong" => {
@@ -463,8 +602,6 @@ impl<'a> Parser<'a> {
                 let s = style_from_attrs(attrs, &self.current_style());
                 self.push_style(s);
             }
-            // 图片：忽略（UI 层独立渲染所有内嵌图）
-            "img" => {}
             _ => {
                 // 未知或不关心的标签：仍然推入一个占位样式，保证 close 时栈平衡
                 self.push_style(self.current_style());
@@ -473,45 +610,53 @@ impl<'a> Parser<'a> {
     }
 
     fn on_close(&mut self, name: &str) {
+        // 块级结束顺序：先 flush_current（用栈顶 attr 给"已结束的段"打上对齐/背景），
+        // 再 pop attr / style，避免父级 attr 越级生效到当前段。
         match name {
             "p" | "div" | "section" | "article" | "header" | "footer" | "main" | "nav"
-            | "aside" | "figure" | "figcaption" | "table" | "tbody" | "thead" | "tfoot"
-            | "address" | "tr" => {
-                self.pop_style();
+            | "aside" | "figure" | "figcaption" | "address" | "center" | "dl" | "dt" | "dd"
+            | "table" | "tbody" | "thead" | "tfoot" | "tr" => {
                 self.flush_current();
+                self.pop_style();
+                self.block_attr_stack.pop();
             }
             "td" | "th" => {
                 self.pop_style();
             }
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                self.pop_style();
                 self.flush_current();
+                self.pop_style();
+                self.block_attr_stack.pop();
             }
             "blockquote" => {
                 if self.quote_depth > 0 {
                     self.quote_depth -= 1;
                 }
-                self.pop_style();
                 self.flush_current();
+                self.pop_style();
+                self.block_attr_stack.pop();
             }
             "ul" | "ol" => {
-                self.pop_style();
                 self.flush_current();
+                self.pop_style();
+                self.block_attr_stack.pop();
             }
             "li" => {
-                self.pop_style();
                 self.flush_current();
+                self.pop_style();
+                self.block_attr_stack.pop();
             }
             "pre" => {
                 if self.pre_depth > 0 {
                     self.pre_depth -= 1;
                 }
-                self.pop_style();
                 self.flush_current();
+                self.pop_style();
+                self.block_attr_stack.pop();
             }
-            "b" | "strong" | "i" | "em" | "cite" | "var" | "u" | "ins" | "s" | "strike"
-            | "del" | "code" | "tt" | "kbd" | "samp" | "small" | "big" | "sup" | "sub"
-            | "mark" | "a" | "font" | "span" => {
+            "b" | "strong" | "i" | "em" | "cite" | "var" | "u" | "ins" | "s" | "strike" | "del"
+            | "code" | "tt" | "kbd" | "samp" | "small" | "big" | "sup" | "sub" | "mark" | "a"
+            | "font" | "span" => {
                 self.pop_style();
             }
             "br" | "hr" | "img" => {}
@@ -550,7 +695,11 @@ impl<'a> Parser<'a> {
 // --- 小工具 ---
 
 fn find_byte(hay: &[u8], from: usize, b: u8) -> Option<usize> {
-    hay.iter().enumerate().skip(from).find(|(_, x)| **x == b).map(|(i, _)| i)
+    hay.iter()
+        .enumerate()
+        .skip(from)
+        .find(|(_, x)| **x == b)
+        .map(|(i, _)| i)
 }
 
 fn find_bytes(hay: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
@@ -581,8 +730,7 @@ fn collapse_ws(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_space = false;
     for c in s.chars() {
-        if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\u{00A0}' || c == '\u{3000}'
-        {
+        if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\u{00A0}' || c == '\u{3000}' {
             if !prev_space {
                 out.push(' ');
                 prev_space = true;
@@ -675,10 +823,72 @@ fn style_from_attrs(attrs: &[(String, String)], base: &SpanStyle) -> SpanStyle {
     s
 }
 
+/// 把元素属性（含 inline `style="..."` 与传统 `align=""` / `bgcolor=""`）解析成块级 align/bg。
+fn block_attr_from_attrs(attrs: &[(String, String)]) -> BlockAttr {
+    let mut out = BlockAttr::default();
+    if let Some(a) = attr(attrs, "align") {
+        if let Some(al) = parse_align(a) {
+            out.align = Some(al);
+        }
+    }
+    if let Some(c) = attr(attrs, "bgcolor").and_then(parse_color) {
+        out.bg = Some(c);
+    }
+    if let Some(css) = attr(attrs, "style") {
+        for decl in css.split(';') {
+            let Some((k, v)) = decl.split_once(':') else {
+                continue;
+            };
+            let k = k.trim().to_ascii_lowercase();
+            let v = v.trim();
+            match k.as_str() {
+                "text-align" => {
+                    if let Some(al) = parse_align(v) {
+                        out.align = Some(al);
+                    }
+                }
+                "background-color" | "background" => {
+                    // background 可能是 shorthand："#fff url(...) ..."；只取第一个能解析的颜色 token
+                    if let Some(c) = v.split_ascii_whitespace().find_map(parse_color) {
+                        out.bg = Some(c);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+fn parse_align(v: &str) -> Option<Align> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "left" | "start" => Some(Align::Start),
+        "center" | "middle" => Some(Align::Center),
+        "right" | "end" => Some(Align::End),
+        "justify" => Some(Align::Justify),
+        _ => None,
+    }
+}
+
+fn parse_dim(v: &str) -> Option<u32> {
+    let v = v.trim();
+    let end = v
+        .char_indices()
+        .find(|(_, c)| !c.is_ascii_digit())
+        .map(|(i, _)| i)
+        .unwrap_or(v.len());
+    if end == 0 {
+        return None;
+    }
+    v[..end].parse().ok()
+}
+
 fn apply_style_attr(style: &mut SpanStyle, css: Option<&str>) {
     let Some(css) = css else { return };
     for decl in css.split(';') {
-        let Some((k, v)) = decl.split_once(':') else { continue };
+        let Some((k, v)) = decl.split_once(':') else {
+            continue;
+        };
         let k = k.trim().to_ascii_lowercase();
         let v = v.trim();
         match k.as_str() {
@@ -819,7 +1029,10 @@ fn parse_color(v: &str) -> Option<[u8; 3]> {
             return Some([r, g, b]);
         }
     }
-    if let Some(rest) = lower.strip_prefix("rgba(").and_then(|s| s.strip_suffix(')')) {
+    if let Some(rest) = lower
+        .strip_prefix("rgba(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
         let parts: Vec<&str> = rest.split(',').collect();
         if parts.len() == 4 {
             let r = parts[0].trim().parse::<u32>().ok()?.min(255) as u8;
@@ -845,7 +1058,7 @@ mod tests {
     fn first_para(html: &str) -> Vec<Span> {
         let blocks = parse(html);
         for b in blocks {
-            if let Block::Paragraph(s) = b {
+            if let BlockKind::Paragraph(s) = b.kind {
                 return s;
             }
         }
@@ -856,7 +1069,9 @@ mod tests {
     fn plain_text_becomes_single_paragraph() {
         let blocks = parse("Hello world");
         assert_eq!(blocks.len(), 1);
-        let Block::Paragraph(spans) = &blocks[0] else { panic!("not paragraph") };
+        let BlockKind::Paragraph(spans) = &blocks[0].kind else {
+            panic!("not paragraph")
+        };
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].text, "Hello world");
         assert!(!spans[0].style.bold);
@@ -876,7 +1091,9 @@ mod tests {
     fn heading_block() {
         let blocks = parse("<h2>标题</h2>");
         assert_eq!(blocks.len(), 1);
-        let Block::Heading(lvl, spans) = &blocks[0] else { panic!("not heading") };
+        let BlockKind::Heading(lvl, spans) = &blocks[0].kind else {
+            panic!("not heading")
+        };
         assert_eq!(*lvl, 2);
         assert!(spans[0].style.bold);
         assert!(spans[0].style.size > 1.0);
@@ -913,14 +1130,63 @@ mod tests {
 
     #[test]
     fn script_and_style_are_skipped() {
-        let blocks =
-            parse("<style>body{color:red}</style><script>alert(1)</script><p>Body</p>");
+        let blocks = parse("<style>body{color:red}</style><script>alert(1)</script><p>Body</p>");
         let text: String = blocks
             .iter()
-            .flat_map(|b| b.spans().unwrap_or(&[]))
-            .map(|s| s.text.clone())
+            .flat_map(|b| b.spans().unwrap_or(&[]).to_vec())
+            .map(|s| s.text)
             .collect();
         assert_eq!(text, "Body");
+    }
+
+    #[test]
+    fn table_keeps_legacy_row_text_flow() {
+        let blocks =
+            parse("<table><tr><td>A</td><td>B</td></tr><tr><td>C</td><td>D</td></tr></table>");
+        assert_eq!(blocks.len(), 2);
+        let BlockKind::Paragraph(row1) = &blocks[0].kind else {
+            panic!("row1 not paragraph")
+        };
+        let BlockKind::Paragraph(row2) = &blocks[1].kind else {
+            panic!("row2 not paragraph")
+        };
+        assert_eq!(
+            row1.iter().map(|s| s.text.as_str()).collect::<String>(),
+            "A B"
+        );
+        assert_eq!(
+            row2.iter().map(|s| s.text.as_str()).collect::<String>(),
+            "C D"
+        );
+    }
+
+    #[test]
+    fn img_becomes_image_block() {
+        let blocks = parse(r#"<p><img src="data:image/png;base64,iVBOR" alt="x" width="32"></p>"#);
+        let img = blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Image(r) => Some(r),
+                _ => None,
+            })
+            .expect("expected image");
+        assert!(img.src.starts_with("data:image/png"));
+        assert_eq!(img.alt.as_deref(), Some("x"));
+        assert_eq!(img.width, Some(32));
+    }
+
+    #[test]
+    fn text_align_and_bgcolor_carry_to_block() {
+        let blocks = parse(r#"<p style="text-align:center;background-color:#ff0">Hi</p>"#);
+        let p = &blocks[0];
+        assert_eq!(p.align, Align::Center);
+        assert_eq!(p.bg, Some([0xff, 0xff, 0x00]));
+    }
+
+    #[test]
+    fn legacy_align_attr_works() {
+        let blocks = parse(r#"<div align="right">x</div>"#);
+        assert_eq!(blocks[0].align, Align::End);
     }
 }
 
@@ -976,4 +1242,3 @@ fn parse_hex_color(hex: &str) -> Option<[u8; 3]> {
         _ => None,
     }
 }
-

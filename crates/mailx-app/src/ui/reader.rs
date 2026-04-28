@@ -1,16 +1,21 @@
 //! 正文阅读面板：
-//! - 面板内显示 sanitize 后的纯文本摘要（快速预览）
-//! - 正文中的内联图 / 图片附件直接在 egui 里渲染（不再只能"在浏览器打开"）
-//! - "在浏览器打开" 把清洗后的 HTML 写入临时目录，交给系统浏览器完整渲染
+//! - 把 sanitize 后的 HTML 解析成富文本块（rich.rs），用 egui 直接渲染——含表格 / 图片 /
+//!   对齐 / 背景色，以接近"主流浏览器"的视觉效果但不内嵌 webview
+//! - "在浏览器打开" 把清洗后的 HTML 写入临时目录，交给系统浏览器完整渲染（兜底，对极端排版邮件）
 //! - 附件列表 + 预览（图片 / PDF / 文本 / Office）
 
 use std::path::PathBuf;
 
 use eframe::egui;
 use mailx_preview::Preview;
-use mailx_render::rich::{self, Block, Span};
+use mailx_render::rich::{self, Align, Block, BlockKind, ImageRef, Span, TableCell};
 use mailx_render::RenderedBody;
 use mailx_store::MessageRow;
+
+const BASE_FONT_SIZE: f32 = 15.0;
+const MIN_ZOOM: f32 = 0.6;
+const MAX_ZOOM: f32 = 2.0;
+const ZOOM_STEP: f32 = 0.1;
 
 /// 预览弹窗状态，由上层持有。
 pub struct PreviewState {
@@ -27,16 +32,26 @@ pub struct CachedBody {
     pub rendered: Result<RenderedBody, String>,
     /// 纯文本兜底（仅在富文本块解析为空、或 HTML 解析失败时使用）。
     pub plain_preview: String,
-    /// HTML → 富文本块（粗体/标题/链接/颜色/字号），供 UI 直接画出。
+    /// HTML → 富文本块（粗体/标题/链接/颜色/字号/对齐/背景/表格/图片），供 UI 直接画出。
     pub blocks: Vec<Block>,
-    /// 正文里可直接内嵌显示的图片（CID 内联 + image/* 附件），解码成 RGBA8。
-    /// 纹理在首次渲染时懒加载，见下方同序 textures 数组。
-    images: Vec<InlineImage>,
+    /// 与 `blocks` 中 `BlockKind::Image` 出现顺序一一对应的解码图。
+    /// 渲染时按出现顺序消费——遇到 Image 块时取 `images[image_cursor]`。
+    images: Vec<DecodedImage>,
     textures: Vec<Option<egui::TextureHandle>>,
+    zoom: f32,
 }
 
-struct InlineImage {
+/// 一张已经从 `<img src>` 解码出来的图。`pixels` 为 None 时表示远程 URL 或解码失败，
+/// UI 退化为"无法显示远程图"占位。
+struct DecodedImage {
+    /// 显示用的标题（alt 优先；否则 "图片 #n"）。
     label: String,
+    pixels: Option<DecodedPixels>,
+    /// 原始 src（远程图占位时显示）。
+    src_hint: String,
+}
+
+struct DecodedPixels {
     width: u32,
     height: u32,
     rgba: Vec<u8>,
@@ -46,9 +61,7 @@ impl CachedBody {
     pub fn load(path: PathBuf) -> Self {
         let rendered = std::fs::read(&path)
             .map_err(|e| format!("读取正文失败: {e}"))
-            .and_then(|raw| {
-                mailx_render::render(&raw).map_err(|e| format!("MIME 解析失败: {e}"))
-            });
+            .and_then(|raw| mailx_render::render(&raw).map_err(|e| format!("MIME 解析失败: {e}")));
         let blocks = match &rendered {
             Ok(body) => rich::parse(&body.html),
             Err(_) => Vec::new(),
@@ -64,39 +77,91 @@ impl CachedBody {
             Err(_) => String::new(),
         };
         let images = match &rendered {
-            Ok(body) => collect_images(body),
+            Ok(body) => collect_images(body, &blocks),
             Err(_) => Vec::new(),
         };
         let textures = (0..images.len()).map(|_| None).collect();
-        Self { path, rendered, plain_preview, blocks, images, textures }
+        Self {
+            path,
+            rendered,
+            plain_preview,
+            blocks,
+            images,
+            textures,
+            zoom: 1.0,
+        }
     }
 }
 
-fn collect_images(body: &RenderedBody) -> Vec<InlineImage> {
+fn collect_images(body: &RenderedBody, blocks: &[Block]) -> Vec<DecodedImage> {
     let mut out = Vec::new();
+    visit_images(blocks, &mut |img| {
+        let label = img
+            .alt
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("图片 #{}", out.len() + 1));
+        let pixels = decode_image_src(&img.src);
+        out.push(DecodedImage {
+            label,
+            pixels,
+            src_hint: short_src(&img.src),
+        });
+    });
+
     for (cid, part) in &body.inline_parts {
         if !part.content_type.to_ascii_lowercase().starts_with("image/") {
             continue;
         }
-        if let Ok((w, h, rgba)) = mailx_preview::decode_image_bytes(&part.data) {
-            out.push(InlineImage { label: format!("内嵌图 {cid}"), width: w, height: h, rgba });
-        }
+        push_decoded_bytes_unique(&mut out, format!("内嵌图 {cid}"), &part.data);
     }
     for att in &body.attachments {
-        // 不仅看 content-type，也看扩展名——有的邮件把内联图打成 application/octet-stream。
         let ct = att.content_type.to_ascii_lowercase();
         let is_image = ct.starts_with("image/") || has_image_ext(&att.filename);
-        if !is_image {
-            continue;
-        }
-        if let Ok((w, h, rgba)) = mailx_preview::decode_image_bytes(&att.data) {
-            out.push(InlineImage { label: att.filename.clone(), width: w, height: h, rgba });
+        if is_image {
+            push_decoded_bytes_unique(&mut out, att.filename.clone(), &att.data);
         }
     }
-    // HTML 里直接内嵌的 data:image/...;base64,... —— 很多营销/通知邮件不走 cid，
-    // 而是把小图 base64 塞进 img src。sanitize 阶段会原样保留，这里扫出来上屏。
     extract_data_uri_images(&body.html, &mut out);
+
     out
+}
+
+fn visit_images(blocks: &[Block], f: &mut impl FnMut(&ImageRef)) {
+    for b in blocks {
+        match &b.kind {
+            BlockKind::Image(img) => f(img),
+            BlockKind::Table(rows) => {
+                for row in rows {
+                    for cell in row {
+                        visit_images(&cell.blocks, f);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn push_decoded_bytes_unique(out: &mut Vec<DecodedImage>, label: String, data: &[u8]) {
+    let Ok((w, h, rgba)) = mailx_preview::decode_image_bytes(data) else {
+        return;
+    };
+    if out.iter().any(|img| match &img.pixels {
+        Some(p) => p.width == w && p.height == h && p.rgba == rgba,
+        None => false,
+    }) {
+        return;
+    }
+    out.push(DecodedImage {
+        label,
+        pixels: Some(DecodedPixels {
+            width: w,
+            height: h,
+            rgba,
+        }),
+        src_hint: String::new(),
+    });
 }
 
 fn has_image_ext(name: &str) -> bool {
@@ -109,14 +174,48 @@ fn has_image_ext(name: &str) -> bool {
     )
 }
 
-fn extract_data_uri_images(html: &str, out: &mut Vec<InlineImage>) {
+/// 试着把 `<img src>` 解成像素：`data:image/...;base64,...` 走 base64 + image crate；
+/// 远程 URL（http/https）一律不抓——避免泄露阅读行为给跟踪像素。
+fn decode_image_src(src: &str) -> Option<DecodedPixels> {
+    let lower = src.trim_start().to_ascii_lowercase();
+    if !lower.starts_with("data:image/") {
+        return None;
+    }
+    // data:image/<sub>[;...];base64,<payload>
+    let comma = src.find(',')?;
+    let header = &src[..comma];
+    let payload = &src[comma + 1..];
+    if !header.to_ascii_lowercase().contains(";base64") {
+        return None;
+    }
+    let bytes = decode_base64(payload)?;
+    let (w, h, rgba) = mailx_preview::decode_image_bytes(&bytes).ok()?;
+    Some(DecodedPixels {
+        width: w,
+        height: h,
+        rgba,
+    })
+}
+
+fn short_src(src: &str) -> String {
+    let trimmed = src.trim();
+    if trimmed.len() > 80 {
+        let head: String = trimmed.chars().take(60).collect();
+        format!("{head}…")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn extract_data_uri_images(html: &str, out: &mut Vec<DecodedImage>) {
     const NEEDLE: &str = "data:image/";
     let mut rest = html;
     let mut idx = 0usize;
     while let Some(pos) = rest.find(NEEDLE) {
         let tail = &rest[pos + NEEDLE.len()..];
-        // 格式：data:image/<subtype>[;charset=...];base64,<payload>  直到遇到 " ' 或 ) 或空白
-        let Some(semi) = tail.find(";base64,") else { break };
+        let Some(semi) = tail.find(";base64,") else {
+            break;
+        };
         let payload_start = semi + ";base64,".len();
         let payload_end = tail[payload_start..]
             .find(|c: char| c == '"' || c == '\'' || c == ')' || c == ' ' || c == '\n')
@@ -124,15 +223,8 @@ fn extract_data_uri_images(html: &str, out: &mut Vec<InlineImage>) {
             .unwrap_or(tail.len());
         let payload = &tail[payload_start..payload_end];
         if let Some(bytes) = decode_base64(payload) {
-            if let Ok((w, h, rgba)) = mailx_preview::decode_image_bytes(&bytes) {
-                idx += 1;
-                out.push(InlineImage {
-                    label: format!("内嵌图 #{idx}"),
-                    width: w,
-                    height: h,
-                    rgba,
-                });
-            }
+            idx += 1;
+            push_decoded_bytes_unique(out, format!("内嵌图 #{idx}"), &bytes);
         }
         rest = &tail[payload_end..];
     }
@@ -140,10 +232,7 @@ fn extract_data_uri_images(html: &str, out: &mut Vec<InlineImage>) {
 
 fn decode_base64(s: &str) -> Option<Vec<u8>> {
     // 极简 base64 解码：忽略空白；不处理 URL-safe 变体（邮件用标准字母表）。
-    let clean: Vec<u8> = s
-        .bytes()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
+    let clean: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     if clean.is_empty() {
         return None;
     }
@@ -191,7 +280,9 @@ pub enum PreviewContent {
         height: u32,
     },
     Error(String),
-    TooLarge { path: PathBuf },
+    TooLarge {
+        path: PathBuf,
+    },
     Unsupported,
 }
 
@@ -213,14 +304,19 @@ pub fn show(
         ui.label("正在加载正文...");
         return preview_request;
     };
-    let body = match &cache.rendered {
-        Ok(b) => b,
-        Err(e) => {
-            ui.colored_label(egui::Color32::RED, e.clone());
-            return preview_request;
-        }
-    };
+    if let Err(e) = &cache.rendered {
+        ui.colored_label(egui::Color32::RED, e.clone());
+        return preview_request;
+    }
 
+    apply_wheel_zoom(ui, &mut cache.zoom);
+
+    ui.horizontal(|ui| {
+        render_zoom_controls(ui, &mut cache.zoom);
+    });
+    ui.separator();
+
+    let body = cache.rendered.as_ref().expect("rendered checked above");
     ui.horizontal(|ui| {
         if ui.button("🌐 在浏览器中打开完整视图").clicked() {
             if let Err(e) = open_in_browser(body) {
@@ -265,51 +361,106 @@ pub fn show(
         ui.separator();
     }
 
-    egui::ScrollArea::vertical()
-        .auto_shrink([false; 2])
-        .show(ui, |ui| {
-            let has_rich = !cache.blocks.is_empty();
-            if has_rich {
-                render_blocks(ui, &cache.blocks);
-            } else if !cache.plain_preview.trim().is_empty() {
-                ui.add(egui::Label::new(cache.plain_preview.as_str()).wrap());
-            }
-            // 正文内联图：首次绘制时上传到 GPU，缓存纹理句柄。
-            if !cache.images.is_empty() {
-                if has_rich || !cache.plain_preview.trim().is_empty() {
-                    ui.add_space(8.0);
-                    ui.separator();
-                }
-                let ctx = ui.ctx().clone();
-                for (idx, img) in cache.images.iter().enumerate() {
-                    if cache.textures[idx].is_none() {
-                        let color_img = egui::ColorImage::from_rgba_unmultiplied(
-                            [img.width as usize, img.height as usize],
-                            &img.rgba,
-                        );
-                        cache.textures[idx] = Some(ctx.load_texture(
-                            format!("inline-{}-{}", cache.path.display(), idx),
-                            color_img,
-                            egui::TextureOptions::LINEAR,
-                        ));
-                    }
-                    if let Some(tex) = &cache.textures[idx] {
-                        ui.add_space(4.0);
-                        ui.weak(&img.label);
-                        let avail = ui.available_width();
-                        let natural = tex.size_vec2();
-                        let scale = if natural.x > avail && natural.x > 0.0 {
-                            avail / natural.x
-                        } else {
-                            1.0
+    let scroll_size = ui.available_size_before_wrap();
+    ui.allocate_ui_with_layout(
+        scroll_size,
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            egui::ScrollArea::both()
+                .id_salt(("mail-body-scroll", cache.path.display().to_string()))
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    let has_rich = !cache.blocks.is_empty();
+                    if has_rich {
+                        let path_id = cache.path.display().to_string();
+                        let mut ctx = RenderCtx {
+                            base_size: BASE_FONT_SIZE * cache.zoom,
+                            panel_bg: ui.visuals().panel_fill,
+                            default_text: ui.visuals().text_color(),
+                            zoom: cache.zoom,
+                            image_cursor: 0,
+                            images: &cache.images,
+                            textures: &mut cache.textures,
+                            path_id: &path_id,
                         };
-                        ui.image((tex.id(), natural * scale));
+                        render_blocks(ui, &cache.blocks, &mut ctx);
+                        if ctx.image_cursor < ctx.images.len() {
+                            ui.add_space(8.0);
+                            ui.separator();
+                            render_standalone_images(ui, ctx.image_cursor, &mut ctx);
+                        }
+                    } else if !cache.plain_preview.trim().is_empty() {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(cache.plain_preview.as_str())
+                                    .size(BASE_FONT_SIZE * cache.zoom),
+                            )
+                            .wrap(),
+                        );
+                        if !cache.images.is_empty() {
+                            ui.add_space(8.0);
+                            ui.separator();
+                            let path_id = cache.path.display().to_string();
+                            let mut ctx = RenderCtx {
+                                base_size: BASE_FONT_SIZE * cache.zoom,
+                                panel_bg: ui.visuals().panel_fill,
+                                default_text: ui.visuals().text_color(),
+                                zoom: cache.zoom,
+                                image_cursor: 0,
+                                images: &cache.images,
+                                textures: &mut cache.textures,
+                                path_id: &path_id,
+                            };
+                            render_standalone_images(ui, 0, &mut ctx);
+                        }
+                    } else if !cache.images.is_empty() {
+                        let path_id = cache.path.display().to_string();
+                        let mut ctx = RenderCtx {
+                            base_size: BASE_FONT_SIZE * cache.zoom,
+                            panel_bg: ui.visuals().panel_fill,
+                            default_text: ui.visuals().text_color(),
+                            zoom: cache.zoom,
+                            image_cursor: 0,
+                            images: &cache.images,
+                            textures: &mut cache.textures,
+                            path_id: &path_id,
+                        };
+                        render_standalone_images(ui, 0, &mut ctx);
                     }
-                }
-            }
-        });
+                });
+        },
+    );
 
     preview_request
+}
+
+fn apply_wheel_zoom(ui: &mut egui::Ui, zoom: &mut f32) {
+    let delta = ui.input(|i| {
+        if i.modifiers.ctrl || i.modifiers.command || i.modifiers.mac_cmd {
+            i.zoom_delta()
+        } else {
+            1.0
+        }
+    });
+    if (delta - 1.0).abs() > 0.001 {
+        *zoom = (*zoom * delta).clamp(MIN_ZOOM, MAX_ZOOM);
+    }
+}
+
+fn render_zoom_controls(ui: &mut egui::Ui, zoom: &mut f32) {
+    if ui.small_button("−").on_hover_text("缩小正文").clicked() {
+        *zoom = (*zoom - ZOOM_STEP).max(MIN_ZOOM);
+    }
+    if ui
+        .small_button(format!("{:.0}%", *zoom * 100.0))
+        .on_hover_text("恢复 100%")
+        .clicked()
+    {
+        *zoom = 1.0;
+    }
+    if ui.small_button("+").on_hover_text("放大正文").clicked() {
+        *zoom = (*zoom + ZOOM_STEP).min(MAX_ZOOM);
+    }
 }
 
 fn make_preview(filename: &str, data: &[u8]) -> PreviewState {
@@ -346,7 +497,11 @@ fn make_preview(filename: &str, data: &[u8]) -> PreviewState {
 
     let content = match mailx_preview::preview_file(&path) {
         Ok(Preview::Text(t)) => PreviewContent::Text(t),
-        Ok(Preview::Image { width, height, rgba }) => PreviewContent::Image {
+        Ok(Preview::Image {
+            width,
+            height,
+            rgba,
+        }) => PreviewContent::Image {
             texture: None,
             rgba,
             width,
@@ -453,67 +608,257 @@ fn render_header(ui: &mut egui::Ui, m: &MessageRow) {
     });
 }
 
+/// 渲染上下文：跨递归调用透传基础信息 + 推进图片游标 + 上传纹理。
+struct RenderCtx<'a> {
+    base_size: f32,
+    panel_bg: egui::Color32,
+    default_text: egui::Color32,
+    zoom: f32,
+    image_cursor: usize,
+    images: &'a [DecodedImage],
+    textures: &'a mut Vec<Option<egui::TextureHandle>>,
+    path_id: &'a str,
+}
+
 /// 把富文本块按视觉期望渲染。每个块之间留一点垂直间距。
 ///
 /// `base_size` 给到 15px —— egui 默认 14 在中文字体上偏细，邮件正文读起来容易糊。
-/// `bg` 是当前面板底色，用来判断邮件自带的 CSS 颜色能不能保留（对比度过低时回退到默认 text color）。
-fn render_blocks(ui: &mut egui::Ui, blocks: &[Block]) {
-    let base_size = 15.0_f32;
-    let bg = ui.visuals().panel_fill;
-    let default_text = ui.visuals().text_color();
+fn render_blocks(ui: &mut egui::Ui, blocks: &[Block], ctx: &mut RenderCtx<'_>) {
     for (i, block) in blocks.iter().enumerate() {
         if i > 0 {
             ui.add_space(4.0);
         }
-        match block {
-            Block::Rule => {
-                ui.separator();
-            }
-            Block::Heading(_, spans) => {
-                render_spans_wrapped(ui, spans, base_size, bg, default_text);
-                ui.add_space(2.0);
-            }
-            Block::Paragraph(spans) => {
-                render_spans_wrapped(ui, spans, base_size, bg, default_text);
-            }
-            Block::Quote(spans) => {
-                // 引用块：稍微调整底色——深色主题下拉亮一点，浅色主题下拉暗一点。
-                let quote_bg = shift_toward(bg, default_text, 0.08);
-                egui::Frame::default()
-                    .fill(quote_bg)
-                    .inner_margin(egui::Margin::symmetric(8.0, 4.0))
-                    .show(ui, |ui| {
-                        render_spans_wrapped(ui, spans, base_size, quote_bg, default_text);
-                    });
-            }
-            Block::ListItem(spans) => {
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    ui.label("•");
-                    let inner = ui.available_width();
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(inner.max(64.0), 0.0),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| render_spans_wrapped(ui, spans, base_size, bg, default_text),
-                    );
-                });
-            }
+        render_one_block(ui, block, ctx);
+    }
+}
+
+/// 渲染一个块：先按 `block.bg` 包一层 Frame，再按 `block.kind` 分发。
+fn render_one_block(ui: &mut egui::Ui, block: &Block, ctx: &mut RenderCtx<'_>) {
+    let bg_for_inner = block
+        .bg
+        .map(|rgb| egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]))
+        .unwrap_or(ctx.panel_bg);
+    let frame = egui::Frame::default()
+        .fill(bg_for_inner)
+        .inner_margin(if block.bg.is_some() {
+            egui::Margin::symmetric(8.0, 4.0)
+        } else {
+            egui::Margin::ZERO
+        });
+    frame.show(ui, |ui| {
+        // 临时切换上下文背景色，影响子节点对比度判断
+        let prev_bg = ctx.panel_bg;
+        ctx.panel_bg = bg_for_inner;
+        render_block_inner(ui, block, ctx);
+        ctx.panel_bg = prev_bg;
+    });
+}
+
+fn render_block_inner(ui: &mut egui::Ui, block: &Block, ctx: &mut RenderCtx<'_>) {
+    match &block.kind {
+        BlockKind::Rule => {
+            ui.separator();
         }
+        BlockKind::Heading(_, spans) => {
+            render_aligned_spans(ui, spans, block.align, ctx);
+            ui.add_space(2.0);
+        }
+        BlockKind::Paragraph(spans) => {
+            render_aligned_spans(ui, spans, block.align, ctx);
+        }
+        BlockKind::Quote(spans) => {
+            // 引用块：稍微调整底色——深色主题下拉亮一点，浅色主题下拉暗一点。
+            let quote_bg = shift_toward(ctx.panel_bg, ctx.default_text, 0.08);
+            egui::Frame::default()
+                .fill(quote_bg)
+                .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                .show(ui, |ui| {
+                    let prev = ctx.panel_bg;
+                    ctx.panel_bg = quote_bg;
+                    render_aligned_spans(ui, spans, block.align, ctx);
+                    ctx.panel_bg = prev;
+                });
+        }
+        BlockKind::ListItem(spans) => {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label("•");
+                render_aligned_spans(ui, spans, block.align, ctx);
+            });
+        }
+        BlockKind::Image(_) => {
+            render_inline_image(ui, block.align, ctx);
+        }
+        BlockKind::Table(rows) => {
+            render_table(ui, rows, ctx);
+        }
+    }
+}
+
+/// 用 `egui::Grid` 渲染一个表格：每个 cell 内容递归走 `render_blocks`。
+/// 邮件 table 普遍只用作"两列对齐 / 标签—值"排版，简单 grid 足够；
+/// colspan/rowspan 用占位空 cell 模拟不做精细处理。
+fn render_table(ui: &mut egui::Ui, rows: &[Vec<TableCell>], ctx: &mut RenderCtx<'_>) {
+    let id = egui::Id::new(("mailx-table", ctx.path_id, ui.next_auto_id()));
+    let max_cols = rows
+        .iter()
+        .map(|r| r.iter().map(|c| c.colspan as usize).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+    if max_cols == 0 {
+        return;
+    }
+    egui::Grid::new(id)
+        .num_columns(max_cols)
+        .spacing(egui::vec2(8.0, 4.0))
+        .striped(false)
+        .show(ui, |ui| {
+            for row in rows {
+                let mut col_used = 0usize;
+                for cell in row {
+                    let bg_color = cell
+                        .bg
+                        .map(|rgb| egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]))
+                        .unwrap_or(ctx.panel_bg);
+                    let frame = egui::Frame::default()
+                        .fill(bg_color)
+                        .inner_margin(egui::Margin::symmetric(6.0, 3.0));
+                    frame.show(ui, |ui| {
+                        let prev_bg = ctx.panel_bg;
+                        ctx.panel_bg = bg_color;
+                        let cell_align = cell.align;
+                        if cell.blocks.is_empty() {
+                            ui.label(if cell.is_header { " " } else { "" });
+                        } else {
+                            for (i, b) in cell.blocks.iter().enumerate() {
+                                if i > 0 {
+                                    ui.add_space(2.0);
+                                }
+                                let mut shadow = b.clone();
+                                if shadow.align == Align::Start {
+                                    shadow.align = cell_align;
+                                }
+                                if cell.is_header {
+                                    if let BlockKind::Paragraph(ref mut spans) = shadow.kind {
+                                        for s in spans.iter_mut() {
+                                            s.style.bold = true;
+                                        }
+                                    }
+                                }
+                                render_one_block(ui, &shadow, ctx);
+                            }
+                        }
+                        ctx.panel_bg = prev_bg;
+                    });
+                    col_used += cell.colspan.max(1) as usize;
+                }
+                // 用空 label 占位补齐到 max_cols，避免 Grid 列数不一致时 layout 漂移
+                while col_used < max_cols {
+                    ui.label("");
+                    col_used += 1;
+                }
+                ui.end_row();
+            }
+        });
+}
+
+fn render_inline_image(ui: &mut egui::Ui, align: Align, ctx: &mut RenderCtx<'_>) {
+    let idx = ctx.image_cursor;
+    ctx.image_cursor += 1;
+    render_image_at(ui, idx, align, false, ctx);
+}
+
+fn render_standalone_images(ui: &mut egui::Ui, start: usize, ctx: &mut RenderCtx<'_>) {
+    for idx in start..ctx.images.len() {
+        if idx > start {
+            ui.add_space(4.0);
+        }
+        render_image_at(ui, idx, Align::Start, true, ctx);
+    }
+}
+
+fn render_image_at(
+    ui: &mut egui::Ui,
+    idx: usize,
+    align: Align,
+    show_label: bool,
+    ctx: &mut RenderCtx<'_>,
+) {
+    if idx >= ctx.images.len() {
+        return;
+    }
+    let img = &ctx.images[idx];
+    let layout_align = match align {
+        Align::Center => Some(egui::Align::Center),
+        Align::End => Some(egui::Align::Max),
+        _ => None,
+    };
+    let mut render = |ui: &mut egui::Ui| {
+        if show_label {
+            ui.weak(&img.label);
+        }
+        if let Some(pixels) = &img.pixels {
+            if ctx.textures[idx].is_none() {
+                let color_img = egui::ColorImage::from_rgba_unmultiplied(
+                    [pixels.width as usize, pixels.height as usize],
+                    &pixels.rgba,
+                );
+                ctx.textures[idx] = Some(ui.ctx().load_texture(
+                    format!("inline-{}-{}", ctx.path_id, idx),
+                    color_img,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+            if let Some(tex) = &ctx.textures[idx] {
+                let avail = ui.available_width();
+                let natural = tex.size_vec2();
+                let scale = if natural.x > 0.0 {
+                    let fit = if natural.x > avail {
+                        avail / natural.x
+                    } else {
+                        1.0
+                    };
+                    (fit * ctx.zoom).max(0.05)
+                } else {
+                    ctx.zoom
+                };
+                ui.image((tex.id(), natural * scale));
+            }
+        } else {
+            ui.weak(format!("🖼 {} (远程图未加载: {})", img.label, img.src_hint));
+        }
+    };
+    if let Some(a) = layout_align {
+        ui.with_layout(egui::Layout::top_down(a), |ui| render(ui));
+    } else {
+        render(ui);
+    }
+}
+
+/// 按 align 决定行内 layout：center / right 用 `with_layout` 整体居中或右对齐；
+/// 其它情况维持现有 `horizontal_wrapped` 左起布局。
+fn render_aligned_spans(ui: &mut egui::Ui, spans: &[Span], align: Align, ctx: &mut RenderCtx<'_>) {
+    if spans.is_empty() {
+        return;
+    }
+    match align {
+        Align::Center => {
+            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                render_spans_wrapped(ui, spans, ctx);
+            });
+        }
+        Align::End => {
+            ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+                render_spans_wrapped(ui, spans, ctx);
+            });
+        }
+        _ => render_spans_wrapped(ui, spans, ctx),
     }
 }
 
 /// 渲染一段 spans —— 遇到 `br_after` 就切行。每行用 `horizontal_wrapped`，
 /// 行内相邻 label / hyperlink 间 spacing 压到 0，避免出现"每个词之间都有大空格"。
-fn render_spans_wrapped(
-    ui: &mut egui::Ui,
-    spans: &[Span],
-    base_size: f32,
-    bg: egui::Color32,
-    default_text: egui::Color32,
-) {
-    if spans.is_empty() {
-        return;
-    }
+fn render_spans_wrapped(ui: &mut egui::Ui, spans: &[Span], ctx: &RenderCtx<'_>) {
     let mut lines: Vec<Vec<&Span>> = Vec::new();
     let mut current: Vec<&Span> = Vec::new();
     for s in spans {
@@ -529,7 +874,7 @@ fn render_spans_wrapped(
     for line in lines {
         let only_blank = line.iter().all(|s| s.text.is_empty());
         if only_blank {
-            ui.add_space(base_size * 0.6);
+            ui.add_space(ctx.base_size * 0.6);
             continue;
         }
         ui.horizontal_wrapped(|ui| {
@@ -538,22 +883,16 @@ fn render_spans_wrapped(
                 if s.text.is_empty() {
                     continue;
                 }
-                draw_span(ui, s, base_size, bg, default_text);
+                draw_span(ui, s, ctx);
             }
         });
     }
 }
 
-fn draw_span(
-    ui: &mut egui::Ui,
-    span: &Span,
-    base_size: f32,
-    bg: egui::Color32,
-    default_text: egui::Color32,
-) {
+fn draw_span(ui: &mut egui::Ui, span: &Span, ctx: &RenderCtx<'_>) {
     let text = &span.text;
     let st = &span.style;
-    let size = (base_size * st.size.max(0.5)).clamp(10.0, base_size * 3.0);
+    let size = (ctx.base_size * st.size.max(0.5)).clamp(10.0, ctx.base_size * 3.0);
     let mut rt = egui::RichText::new(text).size(size);
     if st.bold {
         rt = rt.strong();
@@ -580,7 +919,7 @@ fn draw_span(
     } else {
         st.color.and_then(|rgb| {
             let c = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-            if contrast_ratio(c, bg) >= 3.5 {
+            if contrast_ratio(c, ctx.panel_bg) >= 3.5 {
                 Some(c)
             } else {
                 None
@@ -591,11 +930,12 @@ fn draw_span(
         rt = rt.color(c);
     } else if st.href.is_none() {
         // 显式设一次默认色，避免被上层 weak/muted 派生的样式影响。
-        rt = rt.color(default_text);
+        rt = rt.color(ctx.default_text);
     }
 
     if let Some(href) = &st.href {
-        ui.add(egui::Hyperlink::from_label_and_url(rt, href).open_in_new_tab(true));
+        ui.add(egui::Hyperlink::from_label_and_url(rt, href).open_in_new_tab(true))
+            .on_hover_text(href);
     } else {
         ui.add(egui::Label::new(rt).wrap());
     }
@@ -625,7 +965,11 @@ fn contrast_ratio(a: egui::Color32, b: egui::Color32) -> f32 {
 /// 不会因为硬编码 RGB 在深/浅主题下看起来很突兀。
 fn shift_toward(from: egui::Color32, toward: egui::Color32, amount: f32) -> egui::Color32 {
     let a = amount.clamp(0.0, 1.0);
-    let mix = |x: u8, y: u8| ((x as f32) * (1.0 - a) + (y as f32) * a).round().clamp(0.0, 255.0) as u8;
+    let mix = |x: u8, y: u8| {
+        ((x as f32) * (1.0 - a) + (y as f32) * a)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
     egui::Color32::from_rgb(
         mix(from.r(), toward.r()),
         mix(from.g(), toward.g()),
