@@ -36,23 +36,11 @@ pub fn render(raw: &[u8]) -> Result<RenderedBody> {
         .parse(raw)
         .ok_or_else(|| anyhow!("无法解析 MIME"))?;
 
-    let mut html_body: Option<String> = None;
-    let mut text_body: Option<String> = None;
     let mut inline_parts: HashMap<String, InlinePart> = HashMap::new();
     let mut attachments: Vec<AttachmentPart> = Vec::new();
 
     for part in message.parts.iter() {
         match &part.body {
-            PartType::Html(fallback) => {
-                if html_body.is_none() {
-                    html_body = Some(decode_text_part(raw, part, fallback.as_ref()));
-                }
-            }
-            PartType::Text(fallback) => {
-                if text_body.is_none() {
-                    text_body = Some(decode_text_part(raw, part, fallback.as_ref()));
-                }
-            }
             PartType::Binary(bytes) | PartType::InlineBinary(bytes) => {
                 let ct = part
                     .content_type()
@@ -77,21 +65,33 @@ pub fn render(raw: &[u8]) -> Result<RenderedBody> {
                         continue;
                     }
                 }
-                let filename = part
-                    .attachment_name()
-                    .unwrap_or("attachment.bin")
-                    .to_string();
-                attachments.push(AttachmentPart {
-                    filename,
-                    content_type: ct,
-                    data: bytes.to_vec(),
-                });
             }
             _ => {}
         }
     }
 
-    let plain = text_body.clone().unwrap_or_else(String::new);
+    let html_body = first_body_part(raw, &message.parts, &message.html_body);
+    let text_body = first_body_part(raw, &message.parts, &message.text_body);
+    for (n, part_id) in message.attachments.iter().copied().enumerate() {
+        let Some(part) = message.parts.get(part_id) else {
+            continue;
+        };
+        if is_inline_cid_resource(part) {
+            continue;
+        }
+        let data = attachment_bytes(raw, part);
+        let filename = part
+            .attachment_name()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("attachment-{}.bin", n + 1));
+        attachments.push(AttachmentPart {
+            filename,
+            content_type: content_type_string(part),
+            data,
+        });
+    }
+
+    let plain = text_body.clone().unwrap_or_default();
     let raw_html = html_body.unwrap_or_else(|| {
         html_escape::encode_safe(&plain)
             .replace('\n', "<br/>")
@@ -99,8 +99,48 @@ pub fn render(raw: &[u8]) -> Result<RenderedBody> {
     });
     let html = sanitize::clean_email_html(&raw_html, &inline_parts);
     // 纯文本路径同样要 decode HTML 实体（部分发件方会把 &nbsp;/&amp; 直接塞进 text/plain）。
-    let plain_fallback = html_escape::decode_html_entities(&plain).into_owned();
+    let plain_fallback = clean_mail_text(&html_escape::decode_html_entities(&plain));
     Ok(RenderedBody { html, plain_fallback, inline_parts, attachments })
+}
+
+fn first_body_part(raw: &[u8], parts: &[MessagePart<'_>], ids: &[usize]) -> Option<String> {
+    ids.iter().find_map(|id| match &parts.get(*id)?.body {
+        PartType::Html(fallback) | PartType::Text(fallback) => {
+            Some(decode_text_part(raw, &parts[*id], fallback.as_ref()))
+        }
+        _ => None,
+    })
+}
+
+fn is_inline_cid_resource(part: &MessagePart<'_>) -> bool {
+    part.content_id().is_some()
+        && (matches!(&part.body, PartType::InlineBinary(_))
+            || part
+                .content_type()
+                .map(|c| c.ctype().eq_ignore_ascii_case("image"))
+                .unwrap_or(false))
+}
+
+fn content_type_string(part: &MessagePart<'_>) -> String {
+    part.content_type()
+        .and_then(|c| {
+            let t = c.ctype();
+            c.subtype().map(|s| format!("{t}/{s}"))
+        })
+        .unwrap_or_else(|| "application/octet-stream".into())
+}
+
+fn attachment_bytes(raw: &[u8], part: &MessagePart<'_>) -> Vec<u8> {
+    match &part.body {
+        PartType::Binary(bytes) | PartType::InlineBinary(bytes) => bytes.to_vec(),
+        PartType::Html(fallback) | PartType::Text(fallback) => {
+            decode_transfer_bytes(raw, part, fallback.as_ref().as_bytes())
+        }
+        _ => raw
+            .get(part.raw_body_offset()..part.raw_end_offset())
+            .map(|s| s.to_vec())
+            .unwrap_or_default(),
+    }
 }
 
 /// 从原始报文中取出 text/* 部分的字节，按 Content-Transfer-Encoding 解码后，
@@ -109,27 +149,28 @@ pub fn render(raw: &[u8]) -> Result<RenderedBody> {
 /// 这样可以绕开 mail-parser 在 charset 缺失/误报时产生的乱码（例如 GB2312 正文被按 Latin-1 解出）。
 /// `fallback` 是 mail-parser 已经解码好的字符串，仅当我们拿不到可用 raw 字节时兜底。
 fn decode_text_part(raw: &[u8], part: &MessagePart<'_>, fallback: &str) -> String {
-    let start = part.raw_body_offset();
-    let end = part.raw_end_offset();
-    let Some(slice) = raw.get(start..end) else {
-        return fallback.to_string();
-    };
-    if slice.is_empty() {
-        return fallback.to_string();
-    }
-
-    let cte_decoded: Vec<u8> = match part.encoding {
-        Encoding::Base64 => base64_decode(slice).unwrap_or_else(|| slice.to_vec()),
-        Encoding::QuotedPrintable => {
-            quoted_printable_decode(slice).unwrap_or_else(|| slice.to_vec())
-        }
-        Encoding::None => slice.to_vec(),
-    };
-
+    let cte_decoded = decode_transfer_bytes(raw, part, fallback.as_bytes());
     let declared = part
         .content_type()
         .and_then(|c| c.attribute("charset"));
-    decode_with_charset(&cte_decoded, declared, fallback)
+    clean_mail_text(&decode_with_charset(&cte_decoded, declared, fallback))
+}
+
+fn decode_transfer_bytes(raw: &[u8], part: &MessagePart<'_>, fallback: &[u8]) -> Vec<u8> {
+    let start = part.raw_body_offset();
+    let end = part.raw_end_offset();
+    let Some(slice) = raw.get(start..end) else {
+        return fallback.to_vec();
+    };
+    if slice.is_empty() {
+        return fallback.to_vec();
+    }
+
+    match part.encoding {
+        Encoding::Base64 => base64_decode(slice).unwrap_or_else(|| slice.to_vec()),
+        Encoding::QuotedPrintable => quoted_printable_decode(slice).unwrap_or_else(|| slice.to_vec()),
+        Encoding::None => slice.to_vec(),
+    }
 }
 
 /// 在多个候选 charset 中挑"替换字符最少"的解码结果。
@@ -176,6 +217,19 @@ fn decode_with_charset(bytes: &[u8], declared: Option<&str>, fallback: &str) -> 
     }
 
     best.map(|(s, _)| s).unwrap_or_else(|| fallback.to_string())
+}
+
+fn clean_mail_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\r' => {}
+            '\u{00AD}' | '\u{034F}' | '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' => {}
+            '\u{2007}' | '\u{00A0}' => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// 轻量封装：只要正文纯文本（UI 未接入 wry 前的 fallback）。
@@ -341,7 +395,7 @@ fn collapse_blank_lines(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut blank_run = 0usize;
     for line in s.split('\n') {
-        let trimmed = line.trim_end_matches(|c: char| c == '\r' || c == ' ' || c == '\t');
+        let trimmed = line.trim_end_matches(['\r', ' ', '\t']);
         if trimmed.trim().is_empty() {
             blank_run += 1;
             if blank_run <= 1 {
@@ -355,4 +409,118 @@ fn collapse_blank_lines(s: &str) -> String {
     }
     // 去掉首尾空白
     out.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_attachment_is_not_used_as_body() {
+        let raw = b"From: a@example.org\r\n\
+To: b@example.org\r\n\
+Subject: test\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"b\"\r\n\
+\r\n\
+--b\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+Content-Disposition: attachment; filename=\"note.txt\"\r\n\
+Content-Transfer-Encoding: quoted-printable\r\n\
+\r\n\
+Attachment=20text=20that=20should=20not=20be=20body.\r\n\
+--b\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+Actual body.\r\n\
+--b--\r\n";
+
+        let body = render(raw).expect("render");
+
+        assert_eq!(body.plain_fallback.trim(), "Actual body.");
+        assert_eq!(body.attachments.len(), 1);
+        assert_eq!(body.attachments[0].filename, "note.txt");
+        assert_eq!(
+            String::from_utf8_lossy(&body.attachments[0].data).trim(),
+            "Attachment text that should not be body."
+        );
+    }
+
+    #[test]
+    fn html_attachment_is_kept_out_of_body() {
+        let raw = b"From: a@example.org\r\n\
+To: b@example.org\r\n\
+Subject: test\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"b\"\r\n\
+\r\n\
+--b\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+Content-Disposition: attachment; filename=\"page.html\"\r\n\
+\r\n\
+<h1>Attachment</h1>\r\n\
+--b\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+Visible body.\r\n\
+--b--\r\n";
+
+        let body = render(raw).expect("render");
+
+        assert_eq!(body.plain_fallback.trim(), "Visible body.");
+        assert!(!body.html.contains("Attachment"));
+        assert_eq!(body.attachments.len(), 1);
+        assert_eq!(body.attachments[0].filename, "page.html");
+        assert_eq!(body.attachments[0].content_type, "text/html");
+    }
+
+    #[test]
+    fn cid_inline_image_is_not_listed_as_attachment() {
+        let raw = b"From: a@example.org\r\n\
+To: b@example.org\r\n\
+Subject: test\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/related; boundary=\"b\"\r\n\
+\r\n\
+--b\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+\r\n\
+<p>Hello<img src=\"cid:logo\"></p>\r\n\
+--b\r\n\
+Content-Type: image/png\r\n\
+Content-Transfer-Encoding: base64\r\n\
+Content-ID: <logo>\r\n\
+\r\n\
+AQID\r\n\
+--b--\r\n";
+
+        let body = render(raw).expect("render");
+
+        assert!(body.html.contains("data:image/png;base64,AQID"));
+        assert!(body.inline_parts.contains_key("logo"));
+        assert!(body.attachments.is_empty());
+    }
+
+    #[test]
+    fn invisible_mail_formatting_chars_are_removed_from_text_body() {
+        let raw = "From: a@example.org\r\n\
+To: b@example.org\r\n\
+Subject: test\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+Content-Transfer-Encoding: quoted-printable\r\n\
+\r\n\
+Hidden =E2=80=8C =CD=8F soft=C2=AD hyphen=C2=A0space\r\n";
+
+        let body = render(raw.as_bytes()).expect("render");
+
+        assert_eq!(
+            body.plain_fallback.trim(),
+            "Hidden   soft hyphen space"
+        );
+        assert!(!body.plain_fallback.contains('\u{200C}'));
+        assert!(!body.plain_fallback.contains('\u{034F}'));
+        assert!(!body.plain_fallback.contains('\u{00AD}'));
+        assert!(!body.plain_fallback.contains('\u{00A0}'));
+    }
 }

@@ -2426,6 +2426,7 @@ dependencies = [
  "futures",
  "keyring",
  "mailx-proto",
+ "mailx-render",
  "mailx-store",
  "notify-rust",
  "serde",

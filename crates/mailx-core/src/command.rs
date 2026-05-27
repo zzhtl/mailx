@@ -60,4 +60,6 @@ pub enum Command {
     LoadFolders(AccountId),
     /// UI 拉取邮件列表（按文件夹，最近 limit 封）。
     LoadMessages { folder_id: FolderId, limit: i64 },
+    /// UI 拉取写信窗口的收件人候选列表。
+    LoadRecipientCandidates(AccountId),
 }

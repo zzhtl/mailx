@@ -30,6 +30,8 @@ pub struct MailxApp {
     preview: Option<PreviewState>,
     /// 待确认删除的账户：(id, email)。非 None 时展示确认弹窗。
     pending_delete: Option<(AccountId, String)>,
+    /// 待确认彻底删除的邮件：(id, subject)。非 None 时展示确认弹窗。
+    pending_message_delete: Option<(MessageId, String)>,
     status: String,
     errors: Vec<String>,
 }
@@ -50,6 +52,7 @@ impl MailxApp {
             compose: None,
             preview: None,
             pending_delete: None,
+            pending_message_delete: None,
             status: "就绪".into(),
             errors: Vec::new(),
         }
@@ -76,8 +79,7 @@ impl MailxApp {
                     if self.selected_account == Some(id) {
                         self.selected_account = None;
                         self.selected_folder = None;
-                        self.selected_message = None;
-                        self.current_body = None;
+                        self.clear_message_selection();
                     }
                     self.folders.remove(&id);
                     self.core.send(Command::LoadAccounts);
@@ -86,30 +88,60 @@ impl MailxApp {
                     self.core.send(Command::LoadFolders(account_id));
                 }
                 Event::FoldersLoaded { account_id, folders } => {
-                    self.folders.insert(account_id, folders);
+                    self.handle_folders_loaded(account_id, folders);
                 }
                 Event::FolderSynced { folder_id, new_messages, .. } => {
                     self.status = format!("文件夹同步完成，新增 {new_messages} 封");
                     self.core.send(Command::LoadMessages { folder_id, limit: 200 });
                 }
                 Event::MessagesLoaded { folder_id, messages } => {
-                    self.messages.insert(folder_id, messages);
+                    self.handle_messages_loaded(folder_id, messages);
                 }
                 Event::BodyReady { message_id, body_path } => {
                     if self.selected_message == Some(message_id) {
                         self.current_body = Some(body_path);
                     }
                 }
-                Event::FlagsChanged(_) | Event::MessageDeleted(_) => {
+                Event::FlagsChanged(_) => {
                     if let Some(fid) = self.selected_folder {
                         self.core.send(Command::LoadMessages { folder_id: fid, limit: 200 });
                     }
                 }
-                Event::SendCompleted => self.status = "邮件发送完成".into(),
+                Event::MessageDeleted(id) => {
+                    self.clear_message_selection_if(id);
+                    if self
+                        .pending_message_delete
+                        .as_ref()
+                        .map(|(pending_id, _)| *pending_id == id)
+                        .unwrap_or(false)
+                    {
+                        self.pending_message_delete = None;
+                    }
+                    if let Some(fid) = self.selected_folder {
+                        self.core.send(Command::LoadMessages { folder_id: fid, limit: 200 });
+                    }
+                }
+                Event::RecipientCandidatesLoaded { account_id, recipients } => {
+                    if let Some(state) = &mut self.compose {
+                        if state.account_id == account_id {
+                            state.set_recipient_candidates(recipients);
+                        }
+                    }
+                }
+                Event::SendCompleted => {
+                    self.status = "邮件发送完成".into();
+                    self.compose = None;
+                }
                 Event::SendProgress { bytes_sent, total } => {
                     self.status = format!("发送中 {bytes_sent}/{total}");
                 }
                 Event::Error { context, message } => {
+                    if context == "发送邮件" {
+                        if let Some(state) = &mut self.compose {
+                            state.sending = false;
+                            state.error = Some(message.clone());
+                        }
+                    }
                     self.errors.push(format!("{context}: {message}"));
                     self.status = format!("错误：{message}");
                 }
@@ -172,9 +204,10 @@ impl eframe::App for MailxApp {
                     if self.selected_account != Some(id) {
                         self.selected_account = Some(id);
                         self.selected_folder = None;
-                        self.selected_message = None;
-                        self.current_body = None;
-                        if !self.folders.contains_key(&id) {
+                        self.clear_message_selection();
+                        if self.folders.contains_key(&id) {
+                            self.select_default_folder(id, true);
+                        } else {
                             self.core.send(Command::LoadFolders(id));
                         }
                     }
@@ -200,6 +233,7 @@ impl eframe::App for MailxApp {
                     ui.separator();
                     if ui.button("✉️ 写邮件").clicked() {
                         self.compose = Some(ComposeState::new(account_id));
+                        self.core.send(Command::LoadRecipientCandidates(account_id));
                     }
                     if ui.button("🔄 刷新文件夹").clicked() {
                         self.core.send(Command::RefreshFolders(account_id));
@@ -288,6 +322,35 @@ impl eframe::App for MailxApp {
                 self.pending_delete = None;
             }
         }
+        if let Some((id, subject)) = self.pending_message_delete.clone() {
+            let mut close = false;
+            egui::Window::new("彻底删除邮件")
+                .collapsible(false)
+                .resizable(false)
+                .default_width(420.0)
+                .show(ctx, |ui| {
+                    ui.label("确认彻底删除这封邮件？");
+                    ui.small(subject);
+                    ui.small("这会从服务器删除邮件，通常无法撤销。");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("取消").clicked() {
+                            close = true;
+                        }
+                        if ui
+                            .add(egui::Button::new("确认删除").fill(egui::Color32::from_rgb(0xc0, 0x39, 0x2b)))
+                            .clicked()
+                        {
+                            self.core.send(Command::Delete(id));
+                            self.clear_message_selection_if(id);
+                            close = true;
+                        }
+                    });
+                });
+            if close {
+                self.pending_message_delete = None;
+            }
+        }
 
         // 错误浮层
         if !self.errors.is_empty() {
@@ -307,6 +370,70 @@ impl eframe::App for MailxApp {
 }
 
 impl MailxApp {
+    fn handle_folders_loaded(&mut self, account_id: AccountId, folders: Vec<Folder>) {
+        self.folders.insert(account_id, folders);
+        if self.selected_account == Some(account_id) && self.selected_folder.is_none() {
+            self.select_default_folder(account_id, true);
+        }
+    }
+
+    fn handle_messages_loaded(&mut self, folder_id: FolderId, messages: Vec<MessageRow>) {
+        let first_message_id = messages.first().map(|m| m.id);
+        self.messages.insert(folder_id, messages);
+        if self.selected_folder == Some(folder_id) && self.selected_message.is_none() {
+            if let Some(message_id) = first_message_id {
+                self.select_message(message_id);
+            }
+        }
+    }
+
+    fn select_default_folder(&mut self, account_id: AccountId, sync_remote: bool) {
+        let folder_id = self
+            .folders
+            .get(&account_id)
+            .and_then(|folders| default_folder_id(folders));
+        if let Some(folder_id) = folder_id {
+            self.select_folder(account_id, folder_id, sync_remote);
+        }
+    }
+
+    fn select_folder(&mut self, account_id: AccountId, folder_id: FolderId, sync_remote: bool) {
+        self.selected_folder = Some(folder_id);
+        self.clear_message_selection();
+        self.core.send(Command::LoadMessages { folder_id, limit: 200 });
+        if sync_remote {
+            self.core.send(Command::SyncFolder { account_id, folder_id });
+        }
+    }
+
+    fn select_message(&mut self, message_id: MessageId) {
+        self.selected_message = Some(message_id);
+        self.current_body = None;
+        self.body_cache = None;
+        self.core.send(Command::FetchBody(message_id));
+    }
+
+    fn clear_message_selection(&mut self) {
+        self.selected_message = None;
+        self.current_body = None;
+        self.body_cache = None;
+    }
+
+    fn clear_message_selection_if(&mut self, message_id: MessageId) {
+        if self.selected_message == Some(message_id) {
+            self.clear_message_selection();
+        }
+    }
+
+    fn message_subject(&self, message_id: MessageId) -> String {
+        self.selected_folder
+            .and_then(|fid| self.messages.get(&fid))
+            .and_then(|rows| rows.iter().find(|m| m.id == message_id))
+            .and_then(|m| m.subject.as_deref())
+            .map(mailx_proto::decode_rfc2047)
+            .unwrap_or_else(|| "(无主题)".into())
+    }
+
     fn render_folders_column(
         &mut self,
         ui: &mut egui::Ui,
@@ -329,18 +456,10 @@ impl MailxApp {
                                     for f in folders {
                                         let selected = self.selected_folder == Some(f.id);
                                         let label = display_folder_name(&f.name);
-                                        if ui.selectable_label(selected, label).clicked() {
-                                            self.selected_folder = Some(f.id);
-                                            self.selected_message = None;
-                                            self.current_body = None;
-                                            self.core.send(Command::LoadMessages {
-                                                folder_id: f.id,
-                                                limit: 200,
-                                            });
-                                            self.core.send(Command::SyncFolder {
-                                                account_id,
-                                                folder_id: f.id,
-                                            });
+                                        if ui.selectable_label(selected, label).clicked()
+                                            && !selected
+                                        {
+                                            self.select_folder(account_id, f.id, true);
                                         }
                                     }
                                 } else {
@@ -371,7 +490,7 @@ impl MailxApp {
                     if let Some(fid) = self.selected_folder {
                         let empty = Vec::<MessageRow>::new();
                         let msgs = self.messages.get(&fid).unwrap_or(&empty).clone();
-                        let row_h = 52.0;
+                        let row_h = 68.0;
                         egui::ScrollArea::vertical().auto_shrink([false; 2]).show_rows(
                             ui,
                             row_h,
@@ -397,6 +516,7 @@ impl MailxApp {
         let was_seen = m.seen;
         let subject_raw = m.subject.as_deref().unwrap_or("(无主题)").to_string();
         let from_raw = m.from_addr.as_deref().unwrap_or("?").to_string();
+        let snippet = m.snippet.as_deref().and_then(list_snippet);
         let date_str = m
             .internal_date
             .as_deref()
@@ -428,21 +548,25 @@ impl MailxApp {
                                 "●",
                             );
                         }
+                        if m.has_attachments {
+                            ui.weak("📎");
+                        }
                         ui.strong(mailx_proto::decode_rfc2047(&subject_raw));
                     });
                     ui.horizontal(|ui| {
                         ui.small(mailx_proto::decode_rfc2047(&from_raw));
                         ui.weak(date_str);
                     });
+                    if let Some(snippet) = &snippet {
+                        ui.weak(snippet);
+                    }
                 });
             })
             .response
             .interact(egui::Sense::click());
 
         if response.clicked() {
-            self.selected_message = Some(msg_id);
-            self.current_body = None;
-            self.core.send(Command::FetchBody(msg_id));
+            self.select_message(msg_id);
             if !was_seen {
                 self.core.send(Command::MarkRead { message_id: msg_id, read: true });
             }
@@ -451,18 +575,11 @@ impl MailxApp {
         response.context_menu(|ui| {
             if ui.button("🗑 移至垃圾箱").clicked() {
                 self.core.send(Command::MoveToTrash(msg_id));
-                if self.selected_message == Some(msg_id) {
-                    self.selected_message = None;
-                    self.current_body = None;
-                }
+                self.clear_message_selection_if(msg_id);
                 ui.close_menu();
             }
             if ui.button("❌ 彻底删除").clicked() {
-                self.core.send(Command::Delete(msg_id));
-                if self.selected_message == Some(msg_id) {
-                    self.selected_message = None;
-                    self.current_body = None;
-                }
+                self.pending_message_delete = Some((msg_id, self.message_subject(msg_id)));
                 ui.close_menu();
             }
             ui.separator();
@@ -488,19 +605,30 @@ impl MailxApp {
                 egui::Frame::default().inner_margin(padding).show(ui, |ui| {
                     ui.set_min_width(width - padding.left - padding.right);
                     if let Some(msg_id) = self.selected_message {
+                        let selected_seen = self
+                            .selected_folder
+                            .and_then(|fid| self.messages.get(&fid))
+                            .and_then(|rows| rows.iter().find(|m| m.id == msg_id))
+                            .map(|m| m.seen)
+                            .unwrap_or(true);
                         ui.horizontal(|ui| {
                             if ui.button("🗑 移入垃圾箱").clicked() {
                                 self.core.send(Command::MoveToTrash(msg_id));
-                                self.selected_message = None;
+                                self.clear_message_selection();
                             }
                             if ui.button("❌ 彻底删除").clicked() {
-                                self.core.send(Command::Delete(msg_id));
-                                self.selected_message = None;
+                                self.pending_message_delete =
+                                    Some((msg_id, self.message_subject(msg_id)));
                             }
-                            if ui.button("👁 标记未读").clicked() {
+                            let mark_label = if selected_seen {
+                                "👁 标记未读"
+                            } else {
+                                "✓ 标记已读"
+                            };
+                            if ui.button(mark_label).clicked() {
                                 self.core.send(Command::MarkRead {
                                     message_id: msg_id,
-                                    read: false,
+                                    read: !selected_seen,
                                 });
                             }
                         });
@@ -549,6 +677,31 @@ fn paint_vrule(ui: &mut egui::Ui, height: f32, color: egui::Color32) {
     ui.painter().rect_filled(rect, 0.0, color);
 }
 
+fn list_snippet(raw: &str) -> Option<String> {
+    let compact = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return None;
+    }
+    let max_chars = 72usize;
+    let mut out = String::new();
+    for (i, c) in compact.chars().enumerate() {
+        if i >= max_chars {
+            out.push('…');
+            break;
+        }
+        out.push(c);
+    }
+    Some(out)
+}
+
+fn default_folder_id(folders: &[Folder]) -> Option<FolderId> {
+    folders
+        .iter()
+        .find(|f| f.name.eq_ignore_ascii_case("INBOX"))
+        .or_else(|| folders.first())
+        .map(|f| f.id)
+}
+
 fn display_folder_name(raw: &str) -> String {
     // IMAP 文件夹名在协议上使用 modified UTF-7（RFC 3501 §5.1.3），先解码成 UTF-8 再展示。
     let name = mailx_proto::decode_modified_utf7(raw);
@@ -569,4 +722,105 @@ fn display_folder_name(raw: &str) -> String {
         return format!("🚫 {s}");
     }
     name
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mailx_core::spawn;
+    use mailx_store::Store;
+
+    fn folder(id: FolderId, account_id: AccountId, name: &str) -> Folder {
+        Folder {
+            id,
+            account_id,
+            name: name.into(),
+            delimiter: None,
+            uidvalidity: 0,
+            last_seen_uid: 0,
+        }
+    }
+
+    fn message(id: MessageId, folder_id: FolderId) -> MessageRow {
+        MessageRow {
+            id,
+            folder_id,
+            uid: id,
+            subject: None,
+            from_addr: None,
+            internal_date: None,
+            rfc822_size: None,
+            seen: false,
+            has_attachments: false,
+            snippet: None,
+        }
+    }
+
+    #[test]
+    fn default_folder_prefers_inbox() {
+        let folders = vec![
+            folder(1, 7, "Archive"),
+            folder(2, 7, "INBOX"),
+            folder(3, 7, "Sent"),
+        ];
+
+        assert_eq!(default_folder_id(&folders), Some(2));
+    }
+
+    #[test]
+    fn default_folder_falls_back_to_first_folder() {
+        let folders = vec![folder(1, 7, "Archive"), folder(2, 7, "Sent")];
+
+        assert_eq!(default_folder_id(&folders), Some(1));
+    }
+
+    #[tokio::test]
+    async fn select_default_folder_loads_inbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_at(tmp.path()).await.unwrap();
+        let core = spawn(store);
+        let mut app = MailxApp::new(core);
+
+        app.folders.insert(
+            7,
+            vec![
+                folder(1, 7, "Archive"),
+                folder(2, 7, "INBOX"),
+                folder(3, 7, "Sent"),
+            ],
+        );
+        app.select_default_folder(7, false);
+
+        assert_eq!(app.selected_folder, Some(2));
+        assert_eq!(app.selected_message, None);
+        assert_eq!(app.current_body, None);
+    }
+
+    #[tokio::test]
+    async fn messages_loaded_selects_first_message_for_current_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_at(tmp.path()).await.unwrap();
+        let core = spawn(store);
+        let mut app = MailxApp::new(core);
+
+        app.selected_folder = Some(10);
+        app.handle_messages_loaded(10, vec![message(42, 10), message(43, 10)]);
+
+        assert_eq!(app.selected_message, Some(42));
+        assert_eq!(app.current_body, None);
+    }
+
+    #[tokio::test]
+    async fn messages_loaded_keeps_existing_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_at(tmp.path()).await.unwrap();
+        let core = spawn(store);
+        let mut app = MailxApp::new(core);
+
+        app.selected_folder = Some(10);
+        app.selected_message = Some(99);
+        app.handle_messages_loaded(10, vec![message(42, 10), message(43, 10)]);
+
+        assert_eq!(app.selected_message, Some(99));
+    }
 }

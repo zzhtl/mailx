@@ -218,7 +218,7 @@ fn extract_data_uri_images(html: &str, out: &mut Vec<DecodedImage>) {
         };
         let payload_start = semi + ";base64,".len();
         let payload_end = tail[payload_start..]
-            .find(|c: char| c == '"' || c == '\'' || c == ')' || c == ' ' || c == '\n')
+            .find(['"', '\'', ')', ' ', '\n'])
             .map(|e| payload_start + e)
             .unwrap_or(tail.len());
         let payload = &tail[payload_start..payload_end];
@@ -347,7 +347,7 @@ pub fn show(
                     }
                     if ui.small_button("保存").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
-                            .set_file_name(&att.filename)
+                            .set_file_name(safe_attachment_name(&att.filename))
                             .save_file()
                         {
                             if let Err(e) = std::fs::write(&path, &att.data) {
@@ -465,9 +465,10 @@ fn render_zoom_controls(ui: &mut egui::Ui, zoom: &mut f32) {
 
 fn make_preview(filename: &str, data: &[u8]) -> PreviewState {
     // 附件落盘到临时目录后调用 preview_file
+    let safe_name = safe_attachment_name(filename);
     let tmp = match tempfile::Builder::new()
         .prefix("mailx-att-")
-        .suffix(&format!("-{filename}"))
+        .suffix(&format!("-{safe_name}"))
         .tempfile()
     {
         Ok(t) => t,
@@ -517,6 +518,26 @@ fn make_preview(filename: &str, data: &[u8]) -> PreviewState {
     }
 }
 
+fn safe_attachment_name(name: &str) -> String {
+    let base = std::path::Path::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("attachment.bin");
+    let cleaned: String = base
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    if cleaned.trim_matches('_').trim().is_empty() {
+        "attachment.bin".into()
+    } else {
+        cleaned
+    }
+}
+
 /// 预览 modal 的渲染：返回 true 表示应关闭。
 pub fn show_preview_modal(ctx: &egui::Context, state: &mut PreviewState) -> bool {
     let mut close = false;
@@ -535,7 +556,7 @@ pub fn show_preview_modal(ctx: &egui::Context, state: &mut PreviewState) -> bool
             match &mut state.content {
                 PreviewContent::Text(t) => {
                     egui::ScrollArea::both().show(ui, |ui| {
-                        ui.add(egui::TextEdit::multiline(&mut t.as_str()).desired_rows(30));
+                        ui.add(egui::TextEdit::multiline(t).desired_rows(30));
                     });
                 }
                 PreviewContent::Image {
@@ -825,7 +846,7 @@ fn render_image_at(
                 ui.image((tex.id(), natural * scale));
             }
         } else {
-            ui.weak(format!("🖼 {} (远程图未加载: {})", img.label, img.src_hint));
+            let _ = (&img.label, &img.src_hint);
         }
     };
     if let Some(a) = layout_align {
@@ -986,4 +1007,16 @@ fn human_size(b: u64) -> String {
         i += 1;
     }
     format!("{f:.1} {}", UNITS[i])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_attachment_name_removes_path_and_invalid_chars() {
+        assert_eq!(safe_attachment_name("../dir/report?.txt"), "report_.txt");
+        assert_eq!(safe_attachment_name(r#"bad\name:1.txt"#), "bad_name_1.txt");
+        assert_eq!(safe_attachment_name("\n"), "attachment.bin");
+    }
 }

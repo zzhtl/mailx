@@ -1,5 +1,7 @@
 //! 按邮箱域名命中的主流供应商预设（M1 占位，M2 接入真实 IMAP/SMTP）。
 
+use std::borrow::Cow;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthKind {
     /// 授权码 / 应用专用密码（通过 IMAP/SMTP LOGIN / AUTH PLAIN）。
@@ -18,6 +20,53 @@ pub struct ProviderPreset {
     pub auth: AuthKind,
     /// 163/126 要求 IMAP 登录后立即发 `ID` 命令。
     pub requires_imap_id: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerSettings<'a> {
+    pub name: Cow<'a, str>,
+    pub imap_host: Cow<'a, str>,
+    pub imap_port: u16,
+    pub smtp_host: Cow<'a, str>,
+    pub smtp_port: u16,
+    pub auth: AuthKind,
+    pub requires_imap_id: bool,
+}
+
+impl ProviderPreset {
+    pub fn server_settings(self) -> ServerSettings<'static> {
+        ServerSettings {
+            name: Cow::Borrowed(self.name),
+            imap_host: Cow::Borrowed(self.imap_host),
+            imap_port: self.imap_port,
+            smtp_host: Cow::Borrowed(self.smtp_host),
+            smtp_port: self.smtp_port,
+            auth: self.auth,
+            requires_imap_id: self.requires_imap_id,
+        }
+    }
+}
+
+impl ServerSettings<'static> {
+    pub fn owned(
+        name: impl Into<String>,
+        imap_host: impl Into<String>,
+        imap_port: u16,
+        smtp_host: impl Into<String>,
+        smtp_port: u16,
+        auth: AuthKind,
+        requires_imap_id: bool,
+    ) -> Self {
+        Self {
+            name: Cow::Owned(name.into()),
+            imap_host: Cow::Owned(imap_host.into()),
+            imap_port,
+            smtp_host: Cow::Owned(smtp_host.into()),
+            smtp_port,
+            auth,
+            requires_imap_id,
+        }
+    }
 }
 
 pub const GMAIL: ProviderPreset = ProviderPreset {

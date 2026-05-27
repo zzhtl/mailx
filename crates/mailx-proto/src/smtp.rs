@@ -13,7 +13,7 @@ use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
-use crate::presets::{AuthKind, ProviderPreset};
+use crate::presets::{AuthKind, ServerSettings};
 
 pub struct SmtpCredentials {
     pub email: String,
@@ -31,7 +31,7 @@ pub struct SmtpSendRequest<'a> {
 }
 
 pub async fn send(
-    preset: &ProviderPreset,
+    preset: &ServerSettings<'_>,
     creds: &SmtpCredentials,
     req: SmtpSendRequest<'_>,
 ) -> Result<()> {
@@ -57,13 +57,13 @@ pub async fn send(
     }
     builder = builder.subject(req.subject);
 
-    // 正文：HTML（plain 自动生成 - 简单剥标签）
+    // 正文：HTML + plain fallback。plain 需要保留换行，否则纯文本客户端会把正文挤成一行。
     let html_part = SinglePart::builder()
         .header(ContentType::TEXT_HTML)
         .body(req.body_html.to_string());
     let plain_part = SinglePart::builder()
         .header(ContentType::TEXT_PLAIN)
-        .body(strip_tags(req.body_html));
+        .body(html_to_plain_text(req.body_html));
     let alt = MultiPart::alternative()
         .singlepart(plain_part)
         .singlepart(html_part);
@@ -90,9 +90,9 @@ pub async fn send(
 
     // SMTP 客户端：465 走 implicit TLS（smtps），587 走 STARTTLS
     let mut transport_builder = if preset.smtp_port == 587 {
-        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(preset.smtp_host)?
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(preset.smtp_host.as_ref())?
     } else {
-        AsyncSmtpTransport::<Tokio1Executor>::relay(preset.smtp_host)?
+        AsyncSmtpTransport::<Tokio1Executor>::relay(preset.smtp_host.as_ref())?
     }
     .port(preset.smtp_port);
 
@@ -135,16 +135,140 @@ fn guess_mime(path: &Path) -> String {
     .to_string()
 }
 
-fn strip_tags(html: &str) -> String {
+fn html_to_plain_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut in_tag = false;
+    let mut tag = String::new();
     for c in html.chars() {
         match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(c),
-            _ => {}
+            '<' if !in_tag => {
+                in_tag = true;
+                tag.clear();
+            }
+            '>' if in_tag => {
+                if is_plain_break_tag(&tag) {
+                    trim_trailing_spaces(&mut out);
+                    if !out.ends_with('\n') && !out.is_empty() {
+                        out.push('\n');
+                    }
+                } else if is_plain_cell_tag(&tag)
+                    && !out.ends_with([' ', '\n'])
+                    && !out.is_empty()
+                {
+                    out.push(' ');
+                }
+                in_tag = false;
+            }
+            _ if in_tag => tag.push(c),
+            _ if out.ends_with('\n') && (c == '\n' || c == '\r') => {}
+            _ => out.push(c),
         }
     }
+    decode_basic_html_entities(&out).trim().to_string()
+}
+
+fn is_plain_break_tag(tag: &str) -> bool {
+    matches!(
+        tag_name(tag).as_str(),
+        "br" | "/p" | "/div" | "/li" | "/tr" | "/h1" | "/h2" | "/h3" | "/h4" | "/h5" | "/h6"
+    )
+}
+
+fn is_plain_cell_tag(tag: &str) -> bool {
+    matches!(tag_name(tag).as_str(), "td" | "th" | "/td" | "/th")
+}
+
+fn tag_name(tag: &str) -> String {
+    let s = tag.trim_start();
+    let (prefix, body) = if let Some(rest) = s.strip_prefix('/') {
+        ("/", rest)
+    } else {
+        ("", s)
+    };
+    let name = body
+        .trim_start()
+        .split(|c: char| c.is_ascii_whitespace() || c == '/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    format!("{prefix}{name}")
+}
+
+fn trim_trailing_spaces(s: &mut String) {
+    while s.ends_with(' ') || s.ends_with('\t') {
+        s.pop();
+    }
+}
+
+fn decode_basic_html_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        let tail = &rest[pos + 1..];
+        let Some(end) = tail.find(';') else {
+            out.push('&');
+            rest = tail;
+            continue;
+        };
+        let entity = &tail[..end];
+        match decode_entity(entity) {
+            Some(c) => out.push(c),
+            None => {
+                out.push('&');
+                out.push_str(entity);
+                out.push(';');
+            }
+        }
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
     out
+}
+
+fn decode_entity(entity: &str) -> Option<char> {
+    match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" | "#39" => Some('\''),
+        "nbsp" => Some(' '),
+        _ => decode_numeric_entity(entity),
+    }
+}
+
+fn decode_numeric_entity(entity: &str) -> Option<char> {
+    let n = if let Some(hex) = entity
+        .strip_prefix("#x")
+        .or_else(|| entity.strip_prefix("#X"))
+    {
+        u32::from_str_radix(hex, 16).ok()?
+    } else if let Some(dec) = entity.strip_prefix('#') {
+        dec.parse::<u32>().ok()?
+    } else {
+        return None;
+    };
+    char::from_u32(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_text_fallback_preserves_breaks_and_decodes_entities() {
+        assert_eq!(
+            html_to_plain_text("Hello &lt;mail&gt;<br>\nA&amp;B"),
+            "Hello <mail>\nA&B"
+        );
+    }
+
+    #[test]
+    fn plain_text_fallback_keeps_block_and_cell_boundaries() {
+        assert_eq!(
+            html_to_plain_text("<p>One</p><p>Two</p><table><tr><td>A</td><td>B</td></tr></table>"),
+            "One\nTwo\nA B"
+        );
+    }
 }

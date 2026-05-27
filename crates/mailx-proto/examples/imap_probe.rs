@@ -5,7 +5,7 @@
 //!         cargo run -p mailx-proto --example imap_probe
 
 use anyhow::{Context, Result};
-use mailx_proto::presets::{match_by_email, AuthKind, ProviderPreset};
+use mailx_proto::presets::{match_by_email, AuthKind, ServerSettings};
 use mailx_proto::{ImapClient, ImapCredentials};
 
 #[tokio::main(flavor = "current_thread")]
@@ -16,17 +16,18 @@ async fn main() -> Result<()> {
 
     let email = std::env::var("MAILX_EMAIL").context("set MAILX_EMAIL")?;
     let secret = std::env::var("MAILX_PASSWORD").context("set MAILX_PASSWORD")?;
-    let preset = match_by_email(&email).unwrap_or_else(|| {
+    let preset = match_by_email(&email).map(|p| p.server_settings()).unwrap_or_else(|| {
         eprintln!("domain unknown, falling back to generic IMAPS on port 993");
-        ProviderPreset {
-            name: "Generic",
-            imap_host: Box::leak(email.rsplit('@').next().unwrap().to_string().into_boxed_str()),
-            imap_port: 993,
-            smtp_host: "",
-            smtp_port: 465,
-            auth: AuthKind::AppPassword,
-            requires_imap_id: false,
-        }
+        let domain = email.rsplit_once('@').map(|(_, domain)| domain).unwrap_or("");
+        ServerSettings::owned(
+            "Generic",
+            format!("imap.{domain}"),
+            993,
+            "",
+            465,
+            AuthKind::AppPassword,
+            false,
+        )
     });
     println!("using preset: {}", preset.name);
 

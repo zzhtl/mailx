@@ -3,6 +3,7 @@
 //! 基于 `async-imap`（Tokio 运行时 + TLS）。仅暴露上层需要的操作：
 //! 连接、登录、IMAP ID、LIST、SELECT、UID FETCH、STORE、MOVE。
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -11,7 +12,7 @@ use futures::StreamExt;
 use tokio::net::TcpStream;
 
 use crate::mime::decode_rfc2047;
-use crate::presets::{AuthKind, ProviderPreset};
+use crate::presets::{AuthKind, ServerSettings};
 
 /// 登录凭据。OAuth2 模式下 `secret` 是 access token。
 #[derive(Debug, Clone)]
@@ -40,6 +41,12 @@ pub struct MessageEnvelope {
     pub message_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct MessageFlags {
+    pub uid: u32,
+    pub flags: Vec<String>,
+}
+
 /// 已登录并 SELECT 了某个 mailbox 的会话。
 pub struct ImapClient {
     session: async_imap::Session<async_native_tls::TlsStream<TcpStream>>,
@@ -47,10 +54,10 @@ pub struct ImapClient {
 
 impl ImapClient {
     /// 连接 IMAPS（隐式 TLS，端口通常 993），完成登录。
-    pub async fn connect(preset: &ProviderPreset, creds: &ImapCredentials) -> Result<Self> {
+    pub async fn connect(preset: &ServerSettings<'_>, creds: &ImapCredentials) -> Result<Self> {
         let tcp = tokio::time::timeout(
             Duration::from_secs(15),
-            TcpStream::connect((preset.imap_host, preset.imap_port)),
+            TcpStream::connect((preset.imap_host.as_ref(), preset.imap_port)),
         )
         .await
         .context("IMAP TCP connect timed out")?
@@ -58,7 +65,7 @@ impl ImapClient {
 
         let tls = async_native_tls::TlsConnector::new();
         let tls_stream = tls
-            .connect(preset.imap_host, tcp)
+            .connect(preset.imap_host.as_ref(), tcp)
             .await
             .context("IMAP TLS handshake failed")?;
 
@@ -123,6 +130,32 @@ impl ImapClient {
         }
         drop(stream);
         Ok(out)
+    }
+
+    /// UID FETCH 一段区间，只抓取 UID + FLAGS，用于同步本地状态和远端删除。
+    pub async fn fetch_flags(&mut self, sequence: &str) -> Result<Vec<MessageFlags>> {
+        let mut stream = self
+            .session
+            .uid_fetch(sequence, "(UID FLAGS)")
+            .await?;
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            let fetch = item?;
+            out.push(MessageFlags {
+                uid: fetch.uid.unwrap_or(0),
+                flags: fetch.flags().map(|f| format!("{f:?}")).collect(),
+            });
+        }
+        drop(stream);
+        Ok(out)
+    }
+
+    /// UID SEARCH，返回当前 mailbox 中匹配条件的 UID 集合。
+    ///
+    /// 典型用法是 `search_uids("ALL")`，比 `UID FETCH 1:*` 更适合作为
+    /// “远端到底有哪些 UID” 的权威来源。
+    pub async fn search_uids(&mut self, query: &str) -> Result<HashSet<u32>> {
+        Ok(self.session.uid_search(query).await?)
     }
 
     /// UID FETCH 单封邮件的完整 RFC822 原文。

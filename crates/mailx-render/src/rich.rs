@@ -313,11 +313,45 @@ impl<'a> Parser<'a> {
             return;
         }
         let decoded = html_escape::decode_html_entities(raw);
+        if self.pre_depth > 0 {
+            self.push_pre_text(&decoded);
+            return;
+        }
         let collapsed = collapse_ws(&decoded);
         if collapsed.is_empty() {
             return;
         }
         self.push_text(&collapsed);
+    }
+
+    fn push_pre_text(&mut self, text: &str) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        for chunk in normalized.split_inclusive('\n') {
+            let has_break = chunk.ends_with('\n');
+            let text = chunk.trim_end_matches('\n').replace('\t', "    ");
+            if !text.is_empty() {
+                self.push_raw_text(&text);
+            }
+            if has_break {
+                self.mark_break();
+            }
+        }
+    }
+
+    fn push_raw_text(&mut self, text: &str) {
+        let style = self.current_style();
+        let spans = self.current.spans_mut();
+        if let Some(last) = spans.last_mut() {
+            if !last.br_after && last.style == style {
+                last.text.push_str(text);
+                return;
+            }
+        }
+        spans.push(Span {
+            text: text.to_string(),
+            style,
+            br_after: false,
+        });
     }
 
     fn push_text(&mut self, text: &str) {
@@ -433,6 +467,9 @@ impl<'a> Parser<'a> {
     }
 
     fn on_open(&mut self, name: &str, attrs: &[(String, String)], self_closing: bool) {
+        if (self_closing || is_void_tag(name)) && !matches!(name, "br" | "hr" | "img") {
+            return;
+        }
         match name {
             // 块级 — 起新段落
             "p" | "div" | "section" | "article" | "header" | "footer" | "main" | "nav"
@@ -519,11 +556,10 @@ impl<'a> Parser<'a> {
                 self.mark_break();
             }
             "img" => {
-                let _ = self_closing;
                 if let Some(src) = attr(attrs, "src") {
                     let alt = attr(attrs, "alt").map(|s| s.to_string());
-                    let w = attr(attrs, "width").and_then(|v| parse_dim(v));
-                    let h = attr(attrs, "height").and_then(|v| parse_dim(v));
+                    let w = attr(attrs, "width").and_then(parse_dim);
+                    let h = attr(attrs, "height").and_then(parse_dim);
                     self.flush_current();
                     let attr_now = self.current_block_attr();
                     self.blocks.push(Block {
@@ -722,6 +758,26 @@ fn split_name_attrs(body: &str) -> (&str, &str) {
         Some(i) => (&body[..i], body[i..].trim()),
         None => (body, ""),
     }
+}
+
+fn is_void_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
 }
 
 /// 把一段任意文本里的空白折叠成单个空格，换行视作空格。
@@ -1120,12 +1176,35 @@ mod tests {
     }
 
     #[test]
+    fn void_tag_does_not_leak_parent_style() {
+        let spans = first_para(r##"<span style="color:#ff0000">red<wbr></span>plain"##);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].text, "red");
+        assert_eq!(spans[0].style.color, Some([0xff, 0x00, 0x00]));
+        assert_eq!(spans[1].text, "plain");
+        assert_eq!(spans[1].style.color, None);
+    }
+
+    #[test]
     fn br_breaks_line_within_paragraph() {
         let spans = first_para("<p>one<br>two</p>");
         assert_eq!(spans.len(), 2);
         assert!(spans[0].br_after);
         assert_eq!(spans[0].text, "one");
         assert_eq!(spans[1].text, "two");
+    }
+
+    #[test]
+    fn pre_preserves_spacing_and_line_breaks() {
+        let blocks = parse("<pre>  a\tb\n    c</pre>");
+        let BlockKind::Paragraph(spans) = &blocks[0].kind else {
+            panic!("not paragraph")
+        };
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].text, "  a    b");
+        assert!(spans[0].br_after);
+        assert_eq!(spans[1].text, "    c");
+        assert!(spans.iter().all(|s| s.style.code));
     }
 
     #[test]

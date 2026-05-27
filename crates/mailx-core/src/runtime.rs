@@ -1,13 +1,15 @@
 //! 后台 Tokio runtime + 命令分发 + INBOX 自动轮询 + OS 通知。
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use mailx_proto::{
-    decode_rfc2047, match_by_email, AuthKind, ImapClient, ImapCredentials, ProviderPreset,
+    decode_rfc2047, match_by_email, AuthKind, ImapClient, ImapCredentials, MessageEnvelope,
+    ServerSettings,
 };
-use mailx_store::{AccountId, FolderId, NewAccount, NewMessage, Store};
+use mailx_store::{AccountId, AttachmentRecord, FolderId, NewAccount, NewMessage, RemoteMessageState, Store};
 use tokio::sync::mpsc;
 
 /// 后台 INBOX 轮询周期。轮询用 IMAP UID FETCH（增量），开销小；
@@ -15,6 +17,8 @@ use tokio::sync::mpsc;
 const INBOX_POLL_INTERVAL: Duration = Duration::from_secs(60);
 /// 启动后第一次轮询前的延迟，避开 UI 冷启动时的密集 IO。
 const INBOX_POLL_INITIAL_DELAY: Duration = Duration::from_secs(15);
+/// 单次文件夹同步最多补拉的 envelope 数。UI 当前只展示最近 200 封，避免首次同步几千封历史邮件卡住。
+const MAX_ENVELOPES_PER_SYNC: usize = 500;
 
 use crate::command::{AddAccountReq, Command, ComposeDraft};
 use crate::event::Event;
@@ -96,11 +100,29 @@ async fn run_dispatcher(
         tokio::spawn(async move {
             if let Err(e) = handle_command(&store, &evt_tx, cmd.clone()).await {
                 let _ = evt_tx.send(Event::Error {
-                    context: format!("{cmd:?}"),
+                    context: command_context(&cmd).to_string(),
                     message: format!("{e:#}"),
                 });
             }
         });
+    }
+}
+
+fn command_context(cmd: &Command) -> &'static str {
+    match cmd {
+        Command::AddAccount(_) => "添加账户",
+        Command::DeleteAccount(_) => "删除账户",
+        Command::RefreshFolders(_) => "刷新文件夹",
+        Command::SyncFolder { .. } => "同步文件夹",
+        Command::FetchBody(_) => "加载邮件正文",
+        Command::MarkRead { .. } => "标记已读状态",
+        Command::MoveToTrash(_) => "移入垃圾箱",
+        Command::Delete(_) => "删除邮件",
+        Command::Send(_) => "发送邮件",
+        Command::LoadAccounts => "加载账户",
+        Command::LoadFolders(_) => "加载文件夹",
+        Command::LoadMessages { .. } => "加载邮件列表",
+        Command::LoadRecipientCandidates(_) => "加载收件人列表",
     }
 }
 
@@ -143,6 +165,14 @@ async fn handle_command(
             });
             Ok(())
         }
+        Command::LoadRecipientCandidates(account_id) => {
+            let recipients = store.list_recipient_candidates(account_id, 200).await?;
+            let _ = evt_tx.send(Event::RecipientCandidatesLoaded {
+                account_id,
+                recipients,
+            });
+            Ok(())
+        }
     }
 }
 
@@ -153,32 +183,32 @@ async fn add_account(
 ) -> Result<()> {
     // UI 显式指定 > 按域名自动识别 > 按通用规则构造
     let preset = if let Some(cfg) = req.server.clone() {
-        ProviderPreset {
-            name: "Custom",
-            imap_host: Box::leak(cfg.imap_host.into_boxed_str()),
-            imap_port: cfg.imap_port,
-            smtp_host: Box::leak(cfg.smtp_host.into_boxed_str()),
-            smtp_port: cfg.smtp_port,
-            auth: cfg.auth,
-            requires_imap_id: cfg.requires_imap_id,
-        }
+        ServerSettings::owned(
+            "Custom",
+            cfg.imap_host,
+            cfg.imap_port,
+            cfg.smtp_host,
+            cfg.smtp_port,
+            cfg.auth,
+            cfg.requires_imap_id,
+        )
     } else {
-        match_by_email(&req.email).unwrap_or_else(|| {
+        match_by_email(&req.email).map(|p| p.server_settings()).unwrap_or_else(|| {
             // 通用：按域名构造默认 imaps:993 / smtps:465
             let domain = req
                 .email
                 .rsplit_once('@')
                 .map(|(_, d)| d.to_string())
                 .unwrap_or_default();
-            ProviderPreset {
-                name: "Generic",
-                imap_host: Box::leak(format!("imap.{domain}").into_boxed_str()),
-                imap_port: 993,
-                smtp_host: Box::leak(format!("smtp.{domain}").into_boxed_str()),
-                smtp_port: 465,
-                auth: AuthKind::AppPassword,
-                requires_imap_id: false,
-            }
+            ServerSettings::owned(
+                "Generic",
+                format!("imap.{domain}"),
+                993,
+                format!("smtp.{domain}"),
+                465,
+                AuthKind::AppPassword,
+                false,
+            )
         })
     };
 
@@ -206,9 +236,9 @@ async fn add_account(
             email: req.email.clone(),
             display_name: req.display_name,
             auth_kind: auth_label.into(),
-            imap_host: preset.imap_host.to_string(),
+            imap_host: preset.imap_host.as_ref().to_string(),
             imap_port: preset.imap_port,
-            smtp_host: preset.smtp_host.to_string(),
+            smtp_host: preset.smtp_host.as_ref().to_string(),
             smtp_port: preset.smtp_port,
             requires_imap_id: preset.requires_imap_id,
         })
@@ -275,15 +305,19 @@ async fn sync_folder(
     let (uidvalidity, exists) = client.select(&folder.name).await?;
 
     // uidvalidity 变化意味着服务端 UID 空间被重置，需要全量重拉
-    let start_uid = if folder.uidvalidity as u32 != uidvalidity {
-        1
+    let uidvalidity_changed = folder.uidvalidity as u32 != uidvalidity;
+    if uidvalidity_changed {
+        store.clear_folder_messages(folder_id).await?;
+    }
+    let previous_last_seen = if uidvalidity_changed {
+        0
     } else {
-        (folder.last_seen_uid as u32).saturating_add(1).max(1)
+        folder.last_seen_uid
     };
-
     if exists == 0 {
+        store.clear_folder_messages(folder_id).await?;
         store
-            .update_folder_sync(folder_id, uidvalidity as i64, folder.last_seen_uid)
+            .update_folder_sync(folder_id, uidvalidity as i64, 0)
             .await?;
         client.logout().await.ok();
         let _ = evt_tx.send(Event::FolderSynced {
@@ -294,11 +328,25 @@ async fn sync_folder(
         return Ok(());
     }
 
-    let envelopes = client.fetch_envelopes(&format!("{start_uid}:*")).await?;
-    let mut max_uid: i64 = folder.last_seen_uid;
+    let remote_uids = client.search_uids("ALL").await?;
+    if remote_uids.is_empty() && exists > 0 {
+        client.logout().await.ok();
+        return Err(anyhow!(
+            "IMAP returned no UIDs for non-empty folder {} (exists={exists}); keeping local cache unchanged",
+            folder.name
+        ));
+    }
+    let local_uids = store.list_message_uids(folder_id).await?;
+    let wanted_uids = wanted_sync_uids(
+        &remote_uids,
+        &local_uids,
+        previous_last_seen,
+        MAX_ENVELOPES_PER_SYNC,
+    );
+    let envelopes = fetch_envelopes_for_uids(&mut client, &wanted_uids).await?;
+    let mut max_uid: i64 = previous_last_seen;
     let new_msgs: Vec<NewMessage> = envelopes
         .into_iter()
-        .filter(|e| e.uid as i64 > folder.last_seen_uid as i64)
         .map(|e| {
             max_uid = max_uid.max(e.uid as i64);
             NewMessage {
@@ -314,10 +362,14 @@ async fn sync_folder(
             }
         })
         .collect();
-    let new_count = new_msgs.len();
+    let new_count = new_msgs
+        .iter()
+        .filter(|m| m.uid > previous_last_seen)
+        .count();
     let unseen_samples: Vec<(String, String)> = new_msgs
         .iter()
         .filter(|m| !m.seen)
+        .filter(|m| m.uid > previous_last_seen)
         .take(3)
         .map(|m| {
             (
@@ -326,8 +378,18 @@ async fn sync_folder(
             )
         })
         .collect();
-    let unseen_total = new_msgs.iter().filter(|m| !m.seen).count();
+    let unseen_total = new_msgs
+        .iter()
+        .filter(|m| !m.seen && m.uid > previous_last_seen)
+        .count();
     store.upsert_messages(folder_id, &new_msgs).await?;
+    let remote_flags = fetch_flags_for_uids(&mut client, &remote_uids).await?;
+    let remote_states = remote_states_from_search(remote_uids, remote_flags);
+    let remote_max_uid = remote_states.iter().map(|m| m.uid).max().unwrap_or(max_uid);
+    max_uid = max_uid.max(remote_max_uid);
+    store
+        .reconcile_folder_messages(folder_id, &remote_states)
+        .await?;
     store
         .update_folder_sync(folder_id, uidvalidity as i64, max_uid)
         .await?;
@@ -351,6 +413,90 @@ async fn sync_folder(
         new_messages: new_count,
     });
     Ok(())
+}
+
+fn wanted_sync_uids(
+    remote_uids: &HashSet<u32>,
+    local_uids: &HashSet<i64>,
+    previous_last_seen: i64,
+    limit: usize,
+) -> Vec<i64> {
+    let mut wanted = remote_uids
+        .iter()
+        .map(|uid| *uid as i64)
+        .filter(|uid| *uid > previous_last_seen || !local_uids.contains(uid))
+        .collect::<Vec<_>>();
+    wanted.sort_unstable();
+    if wanted.len() > limit {
+        wanted = wanted.split_off(wanted.len() - limit);
+    }
+    wanted
+}
+
+fn remote_states_from_search(
+    remote_uids: HashSet<u32>,
+    flags: Vec<mailx_proto::MessageFlags>,
+) -> Vec<RemoteMessageState> {
+    let flags_by_uid = flags
+        .into_iter()
+        .filter(|f| f.uid > 0)
+        .map(|f| (f.uid as i64, f))
+        .collect::<HashMap<_, _>>();
+    let mut uids = remote_uids
+        .into_iter()
+        .map(|uid| uid as i64)
+        .collect::<Vec<_>>();
+    uids.sort_unstable();
+    uids.into_iter()
+        .map(|uid| {
+            let flags = flags_by_uid
+                .get(&uid)
+                .map(|f| f.flags.join(" "))
+                .unwrap_or_default();
+            let seen = flags_by_uid
+                .get(&uid)
+                .map(|f| f.flags.iter().any(|flag| flag.contains("Seen")))
+                .unwrap_or(false);
+            RemoteMessageState {
+                uid,
+                flags,
+                seen,
+            }
+        })
+        .collect()
+}
+
+async fn fetch_envelopes_for_uids(
+    client: &mut ImapClient,
+    uids: &[i64],
+) -> Result<Vec<MessageEnvelope>> {
+    let mut out = Vec::new();
+    for chunk in uids.chunks(100) {
+        let sequence = uid_sequence(chunk.iter().copied());
+        out.extend(client.fetch_envelopes(&sequence).await?);
+    }
+    Ok(out)
+}
+
+async fn fetch_flags_for_uids(
+    client: &mut ImapClient,
+    uids: &HashSet<u32>,
+) -> Result<Vec<mailx_proto::MessageFlags>> {
+    let mut sorted = uids.iter().map(|uid| *uid as i64).collect::<Vec<_>>();
+    sorted.sort_unstable();
+    let mut out = Vec::new();
+    for chunk in sorted.chunks(100) {
+        let sequence = uid_sequence(chunk.iter().copied());
+        out.extend(client.fetch_flags(&sequence).await?);
+    }
+    Ok(out)
+}
+
+fn uid_sequence(uids: impl IntoIterator<Item = i64>) -> String {
+    uids.into_iter()
+        .map(|uid| uid.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// 弹出系统级桌面通知。失败不抛错（headless / 无 dbus / Windows 无 WinRT 时静默忽略）。
@@ -456,12 +602,95 @@ async fn fetch_body(
     store
         .set_body_path(message_id, path.to_string_lossy().as_ref())
         .await?;
+    if let Err(e) = index_body_metadata(store, account_id, folder_id, uid, message_id, &path, &raw).await {
+        tracing::warn!("index message body metadata failed: {e:#}");
+    }
 
     let _ = evt_tx.send(Event::BodyReady {
         message_id,
         body_path: path,
     });
     Ok(())
+}
+
+async fn index_body_metadata(
+    store: &Store,
+    account_id: AccountId,
+    folder_id: FolderId,
+    uid: i64,
+    message_id: mailx_store::MessageId,
+    _body_path: &std::path::Path,
+    raw: &[u8],
+) -> Result<()> {
+    let body = mailx_render::render(raw)?;
+    let plain = if body.plain_fallback.trim().is_empty() {
+        mailx_render::html_to_plaintext(&body.html)
+    } else {
+        body.plain_fallback.clone()
+    };
+    let snippet = make_snippet(&plain, 240);
+    let attach_dir = store.attachment_dir_for(account_id, folder_id, uid);
+    let _ = tokio::fs::remove_dir_all(&attach_dir).await;
+    if !body.attachments.is_empty() {
+        tokio::fs::create_dir_all(&attach_dir).await?;
+    }
+    let mut records = Vec::with_capacity(body.attachments.len());
+    for (idx, att) in body.attachments.iter().enumerate() {
+        let filename = safe_attachment_filename(&att.filename);
+        let path = attach_dir.join(format!("{:03}-{}", idx + 1, filename));
+        tokio::fs::write(&path, &att.data).await?;
+        records.push(AttachmentRecord {
+            cid: None,
+            filename: att.filename.clone(),
+            mime_type: att.content_type.clone(),
+            size_bytes: att.data.len() as i64,
+            path: path.to_string_lossy().into_owned(),
+        });
+    }
+    store
+        .replace_message_body_metadata(message_id, Some(&snippet), &records)
+        .await?;
+    Ok(())
+}
+
+fn make_snippet(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut last_was_space = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !last_was_space && !out.is_empty() {
+                out.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            out.push(c);
+            last_was_space = false;
+        }
+        if out.chars().count() >= max_chars {
+            break;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn safe_attachment_filename(name: &str) -> String {
+    let base = std::path::Path::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("attachment.bin");
+    let cleaned: String = base
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    if cleaned.trim().is_empty() {
+        "attachment.bin".into()
+    } else {
+        cleaned
+    }
 }
 
 async fn set_read(
@@ -542,18 +771,7 @@ async fn send_mail(
         .into_iter()
         .find(|a| a.id == draft.account_id)
         .ok_or_else(|| anyhow!("account {} not found", draft.account_id))?;
-    let preset = ProviderPreset {
-        name: Box::leak(account.email.clone().into_boxed_str()),
-        imap_host: Box::leak(account.imap_host.clone().into_boxed_str()),
-        imap_port: account.imap_port as u16,
-        smtp_host: Box::leak(account.smtp_host.clone().into_boxed_str()),
-        smtp_port: account.smtp_port as u16,
-        auth: match account.auth_kind.as_str() {
-            "OAuth2" => AuthKind::OAuth2,
-            _ => AuthKind::AppPassword,
-        },
-        requires_imap_id: account.requires_imap_id,
-    };
+    let preset = account_server_settings(&account);
     let secret = keystore::load_secret(&account.email)?;
 
     // 附件总大小校验：单附件 <=1G；总和软上限 200 MB 给出警告
@@ -610,18 +828,7 @@ async fn open_client(
         .into_iter()
         .find(|a| a.id == account_id)
         .ok_or_else(|| anyhow!("account {account_id} not found"))?;
-    let preset = ProviderPreset {
-        name: Box::leak(account.email.clone().into_boxed_str()),
-        imap_host: Box::leak(account.imap_host.clone().into_boxed_str()),
-        imap_port: account.imap_port as u16,
-        smtp_host: Box::leak(account.smtp_host.clone().into_boxed_str()),
-        smtp_port: account.smtp_port as u16,
-        auth: match account.auth_kind.as_str() {
-            "OAuth2" => AuthKind::OAuth2,
-            _ => AuthKind::AppPassword,
-        },
-        requires_imap_id: account.requires_imap_id,
-    };
+    let preset = account_server_settings(&account);
     let secret = keystore::load_secret(&account.email)?;
     let creds = ImapCredentials {
         email: account.email.clone(),
@@ -630,6 +837,21 @@ async fn open_client(
     };
     let client = ImapClient::connect(&preset, &creds).await?;
     Ok((client, account))
+}
+
+fn account_server_settings(account: &mailx_store::Account) -> ServerSettings<'static> {
+    ServerSettings::owned(
+        account.email.clone(),
+        account.imap_host.clone(),
+        account.imap_port as u16,
+        account.smtp_host.clone(),
+        account.smtp_port as u16,
+        match account.auth_kind.as_str() {
+            "OAuth2" => AuthKind::OAuth2,
+            _ => AuthKind::AppPassword,
+        },
+        account.requires_imap_id,
+    )
 }
 
 async fn find_account_of_folder(store: &Store, folder_id: FolderId) -> Result<AccountId> {
@@ -646,4 +868,47 @@ async fn folder_name_of(store: &Store, folder_id: FolderId) -> Result<String> {
         .fetch_one(store.pool())
         .await?;
     Ok(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wanted_sync_uids_finds_new_and_missing_local_messages() {
+        let remote_uids = HashSet::from([1, 2, 3, 5]);
+        let local_uids = HashSet::from([1, 3]);
+
+        assert_eq!(wanted_sync_uids(&remote_uids, &local_uids, 3, 500), vec![2, 5]);
+    }
+
+    #[test]
+    fn wanted_sync_uids_keeps_latest_when_recovering_large_folder() {
+        let remote_uids = (1..=1000).collect::<HashSet<_>>();
+        let local_uids = HashSet::new();
+
+        let wanted = wanted_sync_uids(&remote_uids, &local_uids, 0, 3);
+
+        assert_eq!(wanted, vec![998, 999, 1000]);
+    }
+
+    #[test]
+    fn remote_states_from_search_keeps_uids_even_when_flags_are_missing() {
+        let remote_uids = HashSet::from([2, 3]);
+        let states = remote_states_from_search(
+            remote_uids,
+            vec![mailx_proto::MessageFlags {
+                uid: 3,
+                flags: vec!["\\Seen".into()],
+            }],
+        );
+
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].uid, 2);
+        assert_eq!(states[0].flags, "");
+        assert!(!states[0].seen);
+        assert_eq!(states[1].uid, 3);
+        assert_eq!(states[1].flags, "\\Seen");
+        assert!(states[1].seen);
+    }
 }

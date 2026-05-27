@@ -16,6 +16,7 @@ pub enum Event {
     BodyReady { message_id: MessageId, body_path: PathBuf },
     FlagsChanged(MessageId),
     MessageDeleted(MessageId),
+    RecipientCandidatesLoaded { account_id: AccountId, recipients: Vec<String> },
     SendProgress { bytes_sent: u64, total: u64 },
     SendCompleted,
     Error { context: String, message: String },
